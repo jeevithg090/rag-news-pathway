@@ -1,549 +1,346 @@
 """
-YouTube Video Analyzer.
-Fetches YouTube videos related to news, downloads audio, transcribes with Whisper,
-and analyzes with OpenRouter LLM.
+YouTube video analyser (optional feature).
+
+Pipeline: Serper video search -> audio download (pytubefix, falling back to yt-dlp) ->
+Whisper transcription -> LLM analysis of the transcript against a news article.
+
+The heavy dependencies (``openai-whisper``, ``pytubefix``, ``yt-dlp``) and ``ffmpeg`` are
+only needed for :meth:`YouTubeAnalyzer.analyze_video`; they are listed in
+``requirements-youtube.txt``.
 """
 
+from __future__ import annotations
+
 import asyncio
+import hashlib
+import importlib.util
 import logging
-import tempfile
-import subprocess
 import os
+import re
+import shutil
+import subprocess
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass, asdict
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
 import httpx
 
 from config import Config
+from connectors.news_connector import MissingAPIKeyError
 
 logger = logging.getLogger(__name__)
 
-# Cache directory for downloaded audio
-CACHE_DIR = Path(__file__).parent.parent / "cache" / "youtube"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+YOUTUBE_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"})
+_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+TRANSCRIPT_PROMPT_CHARS = 4000
+MAX_KEY_POINTS = 5
 
 
 @dataclass
 class YouTubeSearchResult:
-    """Represents a YouTube video search result"""
     video_id: str
     url: str
     title: str
     channel: str
     description: str
-    thumbnail: Optional[str]
-    duration: Optional[str]
-    
-    def to_dict(self) -> Dict[str, Any]:
+    thumbnail: str | None
+    duration: str | None
+
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 @dataclass
 class VideoAnalysisResult:
-    """Result of video analysis"""
     video_url: str
     video_title: str
     transcript: str
     analysis: str
-    key_points: List[str]
+    key_points: list[str]
     sentiment: str
-    
-    def to_dict(self) -> Dict[str, Any]:
+
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
+def extract_video_id(url: str) -> str | None:
+    """Return the 11-character video ID of a YouTube URL, or ``None`` if it is not one."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or (parsed.hostname or "").lower() not in YOUTUBE_HOSTS:
+        return None
+
+    host = parsed.hostname.lower()
+    candidate: str | None = None
+    if host == "youtu.be":
+        candidate = parsed.path.lstrip("/").split("/")[0]
+    elif parsed.path == "/watch":
+        candidate = parse_qs(parsed.query).get("v", [None])[0]
+    elif parsed.path.startswith(("/shorts/", "/embed/", "/live/")):
+        candidate = parsed.path.split("/")[2]
+    return candidate if candidate and _VIDEO_ID_RE.match(candidate) else None
+
+
+def extract_key_points(analysis: str, limit: int = MAX_KEY_POINTS) -> list[str]:
+    """Pull bullet / numbered list items out of an LLM analysis."""
+    points: list[str] = []
+    for line in analysis.splitlines():
+        match = re.match(r"^\s*(?:[-*•]|\d+[.)])\s+(.*\S)", line)
+        if not match:
+            continue
+        point = match.group(1).strip().strip("*").strip()
+        if point:
+            points.append(point)
+        if len(points) >= limit:
+            break
+    return points
+
+
+def detect_sentiment(analysis: str) -> str:
+    """Very rough sentiment label derived from the analysis wording."""
+    match = re.search(r"sentiment\W{0,10}(positive|negative|neutral|mixed)", analysis, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
+    lowered = analysis.lower()
+    if any(word in lowered for word in ("positive", "optimistic", "bullish", "favorable")):
+        return "positive"
+    if any(word in lowered for word in ("negative", "pessimistic", "bearish")):
+        return "negative"
+    return "neutral"
+
+
+def dependency_status() -> dict[str, bool]:
+    return {
+        "ffmpeg": shutil.which("ffmpeg") is not None,
+        "whisper": importlib.util.find_spec("whisper") is not None,
+        "pytubefix": importlib.util.find_spec("pytubefix") is not None,
+        "yt_dlp": importlib.util.find_spec("yt_dlp") is not None,
+    }
+
+
 class YouTubeAnalyzer:
-    """
-    Analyzes YouTube videos related to news articles.
-    Pipeline: Serper Search → yt-dlp Download → Whisper Transcribe → OpenRouter Analyze
-    """
-    
     def __init__(
         self,
-        api_key: str = None,
-        openrouter_key: str = None,
-        whisper_model: str = "base"
+        serper_key: str | None = None,
+        openrouter_key: str | None = None,
+        whisper_model: str | None = None,
+        cache_dir: Path | None = None,
     ):
-        self.api_key = api_key or Config.SERPER_API_KEY
+        self.serper_key = serper_key or Config.SERPER_API_KEY
         self.openrouter_key = openrouter_key or Config.OPENROUTER_API_KEY
-        self.whisper_model = whisper_model
-        self.base_url = "https://google.serper.dev/videos"
-        
-        # Lazy load whisper to avoid import time
-        self._whisper = None
+        self.whisper_model_name = whisper_model or Config.WHISPER_MODEL
+        self.cache_dir = cache_dir or (Config.CACHE_DIR / "youtube")
         self._whisper_model = None
-        
-        if not self.api_key:
-            raise ValueError("SERPER_API_KEY is required")
-        if not self.openrouter_key:
-            raise ValueError("OPENROUTER_API_KEY is required")
-    
-    def _get_whisper(self):
-        """Lazy load whisper model"""
-        if self._whisper is None:
-            import whisper
-            self._whisper = whisper
-            logger.info(f"Loading Whisper model: {self.whisper_model}")
-            self._whisper_model = whisper.load_model(self.whisper_model)
-        return self._whisper_model
-    
-    async def search_youtube_videos(
-        self,
-        query: str,
-        num_results: int = 5
-    ) -> List[YouTubeSearchResult]:
-        """
-        Search for YouTube videos using Serper API.
-        
-        Args:
-            query: Search query (e.g., article title or topic)
-            num_results: Number of results to return
-        
-        Returns:
-            List of YouTubeSearchResult objects
-        """
-        headers = {
-            "X-API-KEY": self.api_key,
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "q": f"{query} youtube",
-            "num": num_results
-        }
-        
+
+    # ------------------------------------------------------------ search
+    async def _serper_videos(self, client: httpx.AsyncClient, query: str, num: int) -> list[dict]:
+        response = await client.post(
+            Config.SERPER_VIDEOS_URL,
+            headers={"X-API-KEY": self.serper_key, "Content-Type": "application/json"},
+            json={"q": query, "num": num},
+        )
+        response.raise_for_status()
+        return response.json().get("videos", [])
+
+    async def search_youtube_videos(self, query: str, num_results: int = 5) -> list[YouTubeSearchResult]:
+        """Search YouTube via Serper, retrying with shorter queries if nothing is found."""
+        if not self.serper_key:
+            raise MissingAPIKeyError("SERPER_API_KEY is not configured")
+
+        words = query.split()
+        attempts = [f"{query} youtube"]
+        if len(words) > 6:
+            attempts.append(f"{' '.join(words[:6])} youtube")
+        if len(words) > 3:
+            attempts.append(f"{' '.join(words[:3])} news youtube")
+
+        videos: list[dict] = []
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                for attempt in attempts:
+                    videos = await self._serper_videos(client, attempt, num_results)
+                    if videos:
+                        break
+        except httpx.HTTPError as exc:
+            logger.error("Serper video search failed for %r: %s", query, exc)
+            return []
+
         results = []
-        
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    self.base_url,
-                    headers=headers,
-                    json=payload,
-                    timeout=30.0
+        for video in videos:
+            link = video.get("link", "")
+            video_id = extract_video_id(link)
+            if not video_id:
+                continue  # skip non-YouTube hits so the UI only offers analysable videos
+            results.append(
+                YouTubeSearchResult(
+                    video_id=video_id,
+                    url=link,
+                    title=video.get("title", ""),
+                    channel=video.get("channel", ""),
+                    description=video.get("snippet", ""),
+                    thumbnail=video.get("imageUrl"),
+                    duration=video.get("duration"),
                 )
-                response.raise_for_status()
-                data = response.json()
-                
-                videos = data.get("videos", [])
-                logger.info(f"Found {len(videos)} YouTube videos for query: {query}")
-                
-                # Fallback strategy if no videos found
-                if not videos and len(query.split()) > 5:
-                    logger.info("No videos found, trying simplified query...")
-                    # Try with first 6 words
-                    simplified_query = " ".join(query.split()[:6])
-                    payload["q"] = f"{simplified_query} youtube"
-                    
-                    response = await client.post(
-                        self.base_url,
-                        headers=headers,
-                        json=payload,
-                        timeout=30.0
-                    )
-                    if response.status_code == 200:
-                        videos = response.json().get("videos", [])
-                        logger.info(f"Found {len(videos)} videos with simplified query: {simplified_query}")
-                
-                # Second fallback: very short query
-                if not videos and len(query.split()) > 3:
-                    logger.info("No videos found, trying keyword query...")
-                    # Try with first 3 words
-                    keyword_query = " ".join(query.split()[:3])
-                    payload["q"] = f"{keyword_query} news youtube"
-                    
-                    response = await client.post(
-                        self.base_url,
-                        headers=headers,
-                        json=payload,
-                        timeout=30.0
-                    )
-                    if response.status_code == 200:
-                        videos = response.json().get("videos", [])
-                        logger.info(f"Found {len(videos)} videos with keyword query: {keyword_query}")
-
-                for video in videos[:num_results]:
-                    # Extract video ID from link
-                    link = video.get("link", "")
-                    video_id = ""
-                    if "watch?v=" in link:
-                        video_id = link.split("watch?v=")[1].split("&")[0]
-                    elif "youtu.be/" in link:
-                        video_id = link.split("youtu.be/")[1].split("?")[0]
-                    
-                    result = YouTubeSearchResult(
-                        video_id=video_id,
-                        url=link,
-                        title=video.get("title", ""),
-                        channel=video.get("channel", ""),
-                        description=video.get("snippet", ""),
-                        thumbnail=video.get("imageUrl"),
-                        duration=video.get("duration")
-                    )
-                    results.append(result)
-                    
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error searching YouTube for '{query}': {e}")
-        except Exception as e:
-            logger.error(f"Error searching YouTube for '{query}': {e}")
-        
+            )
+            if len(results) >= num_results:
+                break
         return results
-    
-    async def download_audio(self, youtube_url: str) -> Optional[str]:
-        """
-        Download audio from YouTube video using pytubefix (more reliable than yt-dlp for 403s).
-        
-        Args:
-            youtube_url: YouTube video URL
-        
-        Returns:
-            Path to downloaded MP3 file, or None if failed
-        """
-        try:
-            from pytubefix import YouTube
-            import hashlib
-            import subprocess
-            import os
-            
-            # Create unique filename based on video URL
-            url_hash = hashlib.md5(youtube_url.encode()).hexdigest()[:12]
-            final_mp3 = CACHE_DIR / f"{url_hash}.mp3"
-            
-            # Check if already cached
-            if final_mp3.exists():
-                logger.info(f"Using cached audio: {final_mp3}")
-                return str(final_mp3)
-            
-            logger.info(f"Downloading audio from: {youtube_url} using pytubefix")
-            
-            # Run in executor to avoid blocking
-            loop = asyncio.get_event_loop()
-            
-            def _download_and_convert():
-                errors = []
-                # Try different clients, some might work while others are blocked
-                clients = ['WEB', 'ANDROID', 'IOS']
-                
-                for client in clients:
-                    try:
-                        logger.info(f"Trying download with client: {client}")
-                        # Initialize YouTube object
-                        yt = YouTube(youtube_url, client=client)
-                        
-                        # Check availability
-                        try:
-                            yt.check_availability()
-                        except Exception as e:
-                            logger.warning(f"Video unavailable with client {client}: {e}")
-                            errors.append(f"{client}: {e}")
-                            continue
 
-                        stream = yt.streams.get_audio_only()
-                        
-                        if not stream:
-                            logger.warning(f"No audio stream with client {client}")
-                            errors.append(f"{client}: No audio stream")
-                            continue
-                            
-                        # Download raw audio (usually m4a or webm)
-                        raw_filename = f"{url_hash}_raw"
-                        downloaded_path = stream.download(output_path=str(CACHE_DIR), filename=raw_filename)
-                        
-                        logger.info(f"Downloaded raw audio to: {downloaded_path}")
-                        
-                        # Convert to MP3 using ffmpeg
-                        cmd = [
-                            'ffmpeg',
-                            '-i', downloaded_path,
-                            '-vn',           # No video
-                            '-acodec', 'libmp3lame', # MP3 encoder
-                            '-q:a', '2',     # Good quality (V2)
-                            '-y',            # Overwrite output
-                            str(final_mp3)
-                        ]
-                        
-                        result = subprocess.run(cmd, capture_output=True, text=True)
-                        
-                        if result.returncode != 0:
-                            logger.error(f"FFmpeg conversion failed: {result.stderr}")
-                            # If conversion fails, try to return the raw file if it's audio
-                            if downloaded_path.endswith('.m4a') or downloaded_path.endswith('.webm'):
-                                logger.warning("Returning raw audio file due to conversion failure")
-                                return downloaded_path
-                            return None
-                            
-                        # Cleanup raw file
-                        try:
-                            os.remove(downloaded_path)
-                        except:
-                            pass
-                            
-                        return str(final_mp3)
-                        
-                    except Exception as e:
-                        logger.warning(f"Error with client {client}: {e}")
-                        errors.append(f"{client}: {e}")
-                        continue
-                
-                logger.error(f"All pytubefix clients failed. Errors: {errors}")
-                return None
+    # ---------------------------------------------------------- download
+    def _download_with_pytubefix(self, url: str, target: Path) -> Path | None:
+        from pytubefix import YouTube
 
-            result_path = await loop.run_in_executor(None, _download_and_convert)
-            
-            if result_path and os.path.exists(result_path):
-                logger.info(f"Audio ready (pytubefix): {result_path}")
-                return result_path
-            
-            # FALLBACK: Try yt-dlp if pytubefix failed
-            logger.info("pytubefix failed, falling back to yt-dlp...")
-            
-            import yt_dlp
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-                'outtmpl': str(CACHE_DIR / f"{url_hash}.%(ext)s"),
-                'quiet': True,
-                'no_warnings': True,
-                'nocheckcertificate': True,
-                'ignoreerrors': False,
-                'no_color': True,
-                'geo_bypass': True,
-                'user_agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'referer': 'https://www.google.com/',
-            }
-            
-            def _download_ytdlp():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([youtube_url])
-            
-            await loop.run_in_executor(None, _download_ytdlp)
-            
-            if final_mp3.exists():
-                logger.info(f"Audio downloaded (yt-dlp): {final_mp3}")
-                return str(final_mp3)
-                
-            return None
-            
-        except ImportError as e:
-            logger.error(f"Dependency missing: {e}. Ensure pytubefix and yt-dlp are installed.")
-            return None
-        except Exception as e:
-            logger.error(f"Error in download_audio: {e}")
-            return None
-    
-    async def transcribe_audio(self, audio_path: str) -> Optional[str]:
-        """
-        Transcribe audio using OpenAI Whisper.
-        
-        Args:
-            audio_path: Path to audio file
-        
-        Returns:
-            Transcribed text, or None if failed
-        """
-        logger.info(f"Transcribing audio: {audio_path}")
-        
+        for client_name in ("WEB", "ANDROID", "IOS"):
+            try:
+                yt = YouTube(url, client=client_name)
+                yt.check_availability()
+                stream = yt.streams.get_audio_only()
+                if not stream:
+                    continue
+                raw_path = Path(stream.download(output_path=str(self.cache_dir), filename=f"{target.stem}_raw"))
+                result = subprocess.run(
+                    ["ffmpeg", "-i", str(raw_path), "-vn", "-acodec", "libmp3lame", "-q:a", "2", "-y", str(target)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    logger.warning("ffmpeg conversion failed; using raw audio file")
+                    return raw_path
+                raw_path.unlink(missing_ok=True)
+                return target
+            except Exception as exc:  # pytubefix raises many client-specific errors
+                logger.warning("pytubefix client %s failed: %s", client_name, exc)
+        return None
+
+    def _download_with_ytdlp(self, url: str, target: Path) -> Path | None:
+        import yt_dlp
+
+        options = {
+            "format": "bestaudio/best",
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+            "outtmpl": str(target.with_suffix(".%(ext)s")),
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+        }
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.download([url])
+        return target if target.exists() else None
+
+    async def download_audio(self, youtube_url: str) -> str | None:
+        """Download a video's audio track as MP3 (cached on disk). Returns its path."""
+        if not extract_video_id(youtube_url):
+            raise ValueError("Not a valid YouTube video URL")
+
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        target = self.cache_dir / f"{hashlib.sha256(youtube_url.encode()).hexdigest()[:16]}.mp3"
+        if target.exists():
+            return str(target)
+
+        loop = asyncio.get_running_loop()
+        for downloader in (self._download_with_pytubefix, self._download_with_ytdlp):
+            try:
+                path = await loop.run_in_executor(None, downloader, youtube_url, target)
+            except ImportError as exc:
+                logger.warning("Downloader unavailable: %s", exc)
+                continue
+            except Exception:
+                logger.exception("Audio download failed with %s", downloader.__name__)
+                continue
+            if path and os.path.exists(path):
+                return str(path)
+        return None
+
+    # -------------------------------------------------------- transcribe
+    async def transcribe_audio(self, audio_path: str) -> str | None:
+        def _transcribe() -> str:
+            if self._whisper_model is None:
+                import whisper
+
+                self._whisper_model = whisper.load_model(self.whisper_model_name)
+            return self._whisper_model.transcribe(audio_path)["text"]
+
         try:
-            # Run whisper in executor to not block
-            loop = asyncio.get_event_loop()
-            
-            def _transcribe():
-                model = self._get_whisper()
-                result = model.transcribe(audio_path)
-                return result["text"]
-            
-            transcript = await loop.run_in_executor(None, _transcribe)
-            logger.info(f"Transcription complete: {len(transcript)} characters")
-            return transcript
-            
-        except Exception as e:
-            logger.error(f"Error transcribing audio: {e}")
+            return await asyncio.get_running_loop().run_in_executor(None, _transcribe)
+        except Exception:
+            logger.exception("Transcription failed")
             return None
-    
+
+    # ----------------------------------------------------------- analyse
     async def analyze_transcript(
-        self,
-        transcript: str,
-        article_title: str,
-        article_content: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        Analyze transcript using OpenRouter LLM.
-        
-        Args:
-            transcript: Video transcript
-            article_title: Related news article title
-            article_content: Optional article content for context
-        
-        Returns:
-            Analysis dictionary with insights
-        """
-        logger.info("Analyzing transcript with OpenRouter")
-        
-        context = f"News Article: {article_title}"
+        self, transcript: str, article_title: str, article_content: str | None = None
+    ) -> dict[str, Any]:
+        if not self.openrouter_key:
+            raise MissingAPIKeyError("OPENROUTER_API_KEY is not configured")
+
+        context = f"News article: {article_title}"
         if article_content:
-            context += f"\n\nArticle Summary: {article_content[:500]}..."
-        
-        prompt = f"""You are an expert news analyst. Analyze this YouTube video transcript in relation to the news article.
+            context += f"\n\nArticle summary: {article_content[:500]}"
+
+        prompt = f"""Analyse this YouTube video transcript in relation to the news article.
 
 {context}
 
-Video Transcript:
-{transcript[:4000]}  # Limit to avoid token limits
+Video transcript:
+{transcript[:TRANSCRIPT_PROMPT_CHARS]}
 
-Please provide:
-1. **Summary**: A concise summary of the video's main points (2-3 sentences)
-2. **Video Perspective**: What is the video creator's opinion/stance on this news?
-3. **Key Points**: List 3-5 key insights from the video
-4. **Sentiment**: Is the video positive, negative, or neutral about the news topic?
-5. **Additional Context**: Any unique information or perspective the video adds that isn't in the news article
-
-Format your response clearly with these sections."""
+Provide:
+1. **Summary**: the video's main points (2-3 sentences)
+2. **Video perspective**: the creator's stance on this news
+3. **Key points**: 3-5 bullet points
+4. **Sentiment**: positive, negative, neutral or mixed
+5. **Additional context**: anything the video adds that the article does not"""
 
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=Config.LLM_TIMEOUT_SECONDS) as client:
                 response = await client.post(
                     f"{Config.LLM_BASE_URL}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self.openrouter_key}",
-                        "Content-Type": "application/json",
-                        "HTTP-Referer": "http://localhost:8000",
-                        "X-Title": "News AI Platform"
-                    },
+                    headers={"Authorization": f"Bearer {self.openrouter_key}", "X-Title": "Live AI News"},
                     json={
                         "model": Config.LLM_MODEL,
                         "messages": [
-                            {"role": "system", "content": "You are a news and media analyst expert."},
-                            {"role": "user", "content": prompt}
+                            {"role": "system", "content": "You are an expert news and media analyst."},
+                            {"role": "user", "content": prompt},
                         ],
                         "temperature": 0.7,
-                        "max_tokens": 1500
+                        "max_tokens": 1500,
                     },
-                    timeout=60.0
                 )
                 response.raise_for_status()
-                data = response.json()
-                
-                analysis = data["choices"][0]["message"]["content"]
-                
-                # Parse key points (simple extraction)
-                key_points = []
-                for line in analysis.split("\n"):
-                    if line.strip().startswith(("- ", "• ", "* ", "1.", "2.", "3.", "4.", "5.")):
-                        point = line.strip().lstrip("-•* 0123456789.").strip()
-                        if point and len(key_points) < 5:
-                            key_points.append(point)
-                
-                # Detect sentiment
-                sentiment = "neutral"
-                lower_analysis = analysis.lower()
-                if any(word in lower_analysis for word in ["positive", "optimistic", "bullish", "favorable"]):
-                    sentiment = "positive"
-                elif any(word in lower_analysis for word in ["negative", "pessimistic", "bearish", "critical"]):
-                    sentiment = "negative"
-                
-                return {
-                    "analysis": analysis,
-                    "key_points": key_points,
-                    "sentiment": sentiment
-                }
-                
-        except Exception as e:
-            logger.error(f"Error analyzing transcript: {e}")
-            return {
-                "analysis": "Analysis failed. Please try again.",
-                "key_points": [],
-                "sentiment": "unknown"
-            }
-    
+                analysis = response.json()["choices"][0]["message"]["content"] or ""
+        except (httpx.HTTPError, KeyError, IndexError):
+            logger.exception("Transcript analysis failed")
+            return {"analysis": "Analysis failed. Please try again.", "key_points": [], "sentiment": "unknown"}
+
+        return {
+            "analysis": analysis,
+            "key_points": extract_key_points(analysis),
+            "sentiment": detect_sentiment(analysis),
+        }
+
     async def analyze_video(
         self,
         youtube_url: str,
         article_title: str,
-        article_content: Optional[str] = None
-    ) -> Optional[VideoAnalysisResult]:
-        """
-        Complete pipeline: Download → Transcribe → Analyze.
-        
-        Args:
-            youtube_url: YouTube video URL
-            article_title: Related news article title
-            article_content: Optional article content
-        
-        Returns:
-            VideoAnalysisResult or None if failed
-        """
-        logger.info(f"Starting full video analysis for: {youtube_url}")
-        
-        # Step 1: Download audio
+        article_content: str | None = None,
+        video_title: str | None = None,
+    ) -> VideoAnalysisResult | None:
         audio_path = await self.download_audio(youtube_url)
         if not audio_path:
             return None
-        
-        # Step 2: Transcribe
         transcript = await self.transcribe_audio(audio_path)
         if not transcript:
             return None
-        
-        # Step 3: Analyze
-        analysis_result = await self.analyze_transcript(
-            transcript,
-            article_title,
-            article_content
-        )
-        
-        # Get video title from search results (if available)
-        video_title = article_title  # Fallback
-        
+        result = await self.analyze_transcript(transcript, article_title, article_content)
         return VideoAnalysisResult(
             video_url=youtube_url,
-            video_title=video_title,
+            video_title=video_title or article_title,
             transcript=transcript,
-            analysis=analysis_result["analysis"],
-            key_points=analysis_result["key_points"],
-            sentiment=analysis_result["sentiment"]
+            analysis=result["analysis"],
+            key_points=result["key_points"],
+            sentiment=result["sentiment"],
         )
-    
-    def clear_cache(self):
-        """Clear downloaded audio cache"""
-        import shutil
-        if CACHE_DIR.exists():
-            shutil.rmtree(CACHE_DIR)
-            CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            logger.info("YouTube audio cache cleared")
-
-
-# Singleton instance
-_youtube_analyzer: Optional[YouTubeAnalyzer] = None
-
-
-def get_youtube_analyzer() -> YouTubeAnalyzer:
-    """Get or create YouTubeAnalyzer singleton"""
-    global _youtube_analyzer
-    if _youtube_analyzer is None:
-        _youtube_analyzer = YouTubeAnalyzer()
-    return _youtube_analyzer
-
-
-# Test function
-async def test_analyzer():
-    """Test the YouTube analyzer"""
-    analyzer = get_youtube_analyzer()
-    
-    print("Testing YouTube Video Search...")
-    results = await analyzer.search_youtube_videos("Tesla stock news", num_results=3)
-    
-    print(f"\nFound {len(results)} videos:")
-    for r in results:
-        print(f"  - {r.title} ({r.channel})")
-        print(f"    URL: {r.url}")
-    
-    return results
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(test_analyzer())

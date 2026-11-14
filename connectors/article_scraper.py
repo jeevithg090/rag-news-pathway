@@ -98,7 +98,8 @@ class ArticleScraper:
             logger.warning("Failed to scrape %s: %s", url, exc)
             return None
 
-        if article is None or not (article.title or article.maintext):
+        # news-please returns None or an empty dict when the download fails.
+        if not hasattr(article, "maintext") or not (article.title or article.maintext):
             logger.warning("No article content extracted from %s", url)
             return None
 

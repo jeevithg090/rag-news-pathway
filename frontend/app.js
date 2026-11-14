@@ -4,9 +4,31 @@
  */
 
 const API_BASE = '/api';
+const USER_ID_KEY = 'news_ai_user_id';
 let wsConnection = null;
+let feedReloadTimer = null;
 let currentArticleId = null;
 let articles = [];
+const userId = getOrCreateUserId();
+
+function getOrCreateUserId() {
+    try {
+        let id = localStorage.getItem(USER_ID_KEY);
+        if (!id) {
+            id = `user_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+            localStorage.setItem(USER_ID_KEY, id);
+        }
+        return id;
+    } catch (error) {
+        return null; // storage unavailable (private mode); personalisation is skipped
+    }
+}
+
+function withUser(params = {}) {
+    const query = new URLSearchParams(params);
+    if (userId) query.set('user_id', userId);
+    return query.toString();
+}
 
 // ============ Initialization ============
 
@@ -89,7 +111,14 @@ async function fetchAPI(endpoint, options = {}) {
         });
 
         if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
+            let detail = `HTTP ${response.status}`;
+            try {
+                const body = await response.json();
+                if (typeof body.detail === 'string') detail = body.detail;
+            } catch (_) { /* non-JSON error body */ }
+            const error = new Error(detail);
+            error.status = response.status;
+            throw error;
         }
 
         return await response.json();
@@ -115,17 +144,20 @@ async function loadStats() {
 
 async function loadNewsFeed() {
     const feedContainer = document.getElementById('news-feed');
-    feedContainer.innerHTML = '<div class="loading">Loading articles</div>';
+    feedContainer.setAttribute('aria-busy', 'true');
+    if (!articles.length) feedContainer.innerHTML = '<div class="loading">Loading articles</div>';
 
     try {
-        const data = await fetchAPI('/news/feed?limit=30');
+        const data = await fetchAPI(`/news/feed?${withUser({ limit: 30 })}`);
         articles = data.articles || [];
 
         renderArticles(articles);
+        feedContainer.setAttribute('aria-busy', 'false');
         updateCompareDropdowns();
         updateStats();
 
     } catch (error) {
+        feedContainer.setAttribute('aria-busy', 'false');
         feedContainer.innerHTML = `
             <div class="empty-state">
                 <div class="empty-icon">⚠️</div>
@@ -151,6 +183,16 @@ function renderArticles(articlesToRender) {
     }
 
     feedContainer.innerHTML = articlesToRender.map(article => createNewsCard(article)).join('');
+    feedContainer.querySelectorAll('.news-card').forEach(card => {
+        const open = () => openArticle(card.dataset.articleId);
+        card.addEventListener('click', open);
+        card.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                open();
+            }
+        });
+    });
 }
 
 function createNewsCard(article) {
@@ -159,7 +201,8 @@ function createNewsCard(article) {
     const score = article.relevance_score || article.score || 0;
 
     return `
-        <article class="news-card" onclick="openArticle('${article.article_id}')">
+        <article class="news-card" role="button" tabindex="0" data-article-id="${escapeHtml(article.article_id)}"
+            aria-label="Open article: ${escapeHtml(article.title || 'Untitled')}">
             <div class="news-card-content">
                 <div class="news-card-meta">
                     <span class="news-category">${escapeHtml(article.category || 'News')}</span>
@@ -232,12 +275,14 @@ async function fetchNews() {
         await loadStats();
 
     } catch (error) {
-        showNotification('❌ Error fetching news', 'error');
+        showNotification(`Could not fetch news: ${error.message}`, 'error');
     }
 
     btn.innerHTML = originalContent;
     btn.disabled = false;
 }
+
+let lastFocusedElement = null;
 
 // ============ Article Modal ============
 
@@ -246,11 +291,15 @@ async function openArticle(articleId) {
     const modal = document.getElementById('article-modal');
     const content = document.getElementById('modal-article-content');
 
+    lastFocusedElement = document.activeElement;
     modal.classList.add('active');
+    modal.setAttribute('aria-hidden', 'false');
     content.innerHTML = '<div class="loading">Loading article</div>';
+    resetYouTubeSection();
+    modal.querySelector('.modal-close').focus();
 
     try {
-        const data = await fetchAPI(`/news/article/${articleId}`);
+        const data = await fetchAPI(`/news/article/${encodeURIComponent(articleId)}?${withUser()}`);
         const article = data.article;
 
         content.innerHTML = `
@@ -260,6 +309,7 @@ async function openArticle(articleId) {
                 ${escapeHtml(article.source || 'Unknown source')} • ${article.publish_date ? new Date(article.publish_date).toLocaleDateString() : 'Recent'}
             </div>
             <div class="article-content">${escapeHtml(article.content || 'No content available')}</div>
+            ${safeUrl(article.url) ? `<p><a href="${escapeHtml(article.url)}" target="_blank" rel="noopener noreferrer">Read the original article</a></p>` : ''}
         `;
 
         // Show comparison suggestion
@@ -269,7 +319,7 @@ async function openArticle(articleId) {
             suggestionDiv.innerHTML = `
                 <p><strong>💡 Want to compare?</strong></p>
                 <p style="margin: 0.5rem 0; color: var(--text-secondary);">Similar article: "${escapeHtml(s.titles[1])}"</p>
-                <button class="btn-primary" style="margin-top: 0.5rem" onclick="startComparison('${s.article_ids[0]}', '${s.article_ids[1]}')">
+                <button class="btn-primary" style="margin-top: 0.5rem" data-a="${escapeHtml(s.article_ids[0])}" data-b="${escapeHtml(s.article_ids[1])}" onclick="startComparison(this.dataset.a, this.dataset.b)">
                     Compare Articles
                 </button>
             `;
@@ -286,8 +336,12 @@ async function openArticle(articleId) {
 }
 
 function closeModal() {
-    document.getElementById('article-modal').classList.remove('active');
+    const modal = document.getElementById('article-modal');
+    if (!modal.classList.contains('active')) return;
+    modal.classList.remove('active');
+    modal.setAttribute('aria-hidden', 'true');
     currentArticleId = null;
+    if (lastFocusedElement && document.body.contains(lastFocusedElement)) lastFocusedElement.focus();
 }
 
 // Close modal on escape
@@ -342,15 +396,15 @@ async function sendChatMessage() {
     try {
         const result = await fetchAPI('/chat/query', {
             method: 'POST',
-            body: JSON.stringify({ query })
+            body: JSON.stringify({ query, user_id: userId })
         });
 
         document.getElementById(loadingId).querySelector('.message-content').innerHTML =
-            `<p>${formatResponse(result.response)}</p>`;
+            `<p>${formatResponse(result.response)}</p>${renderSources(result)}`;
 
     } catch (error) {
         document.getElementById(loadingId).querySelector('.message-content').innerHTML =
-            '<p>Sorry, there was an error processing your question. Please try again.</p>';
+            `<p class="error-text">Sorry, something went wrong: ${escapeHtml(error.message)}</p>`;
     }
 
     scrollToBottom(messagesDiv);
@@ -375,15 +429,15 @@ async function sendArticleChatMessage() {
     try {
         const result = await fetchAPI(`/chat/article/${currentArticleId}`, {
             method: 'POST',
-            body: JSON.stringify({ query, expand_context: true })
+            body: JSON.stringify({ query, expand_context: true, user_id: userId })
         });
 
         document.getElementById(loadingId).querySelector('.message-content').innerHTML =
-            `<p>${formatResponse(result.response)}</p>`;
+            `<p>${formatResponse(result.response)}</p>${renderSources(result)}`;
 
     } catch (error) {
         document.getElementById(loadingId).querySelector('.message-content').innerHTML =
-            '<p>Sorry, there was an error.</p>';
+            `<p class="error-text">Sorry, something went wrong: ${escapeHtml(error.message)}</p>`;
     }
 
     scrollToBottom(messagesDiv);
@@ -396,7 +450,7 @@ function updateCompareDropdowns() {
     const select2 = document.getElementById('compare-select-2');
 
     const options = articles.map(a =>
-        `<option value="${a.article_id}">${escapeHtml(truncate(a.title, 60))}</option>`
+        `<option value="${escapeHtml(a.article_id)}">${escapeHtml(truncate(a.title, 60))}</option>`
     ).join('');
 
     select1.innerHTML = `<option value="">Select an article...</option>${options}`;
@@ -431,8 +485,8 @@ async function compareArticles() {
     const id2 = document.getElementById('compare-select-2').value;
     const query = document.getElementById('compare-query').value.trim() || 'Compare these two articles in detail';
 
-    if (!id1 || !id2) {
-        showNotification('Please select two articles to compare', 'warning');
+    if (!id1 || !id2 || id1 === id2) {
+        showNotification('Please select two different articles to compare', 'warning');
         return;
     }
 
@@ -444,14 +498,15 @@ async function compareArticles() {
             method: 'POST',
             body: JSON.stringify({
                 article_ids: [id1, id2],
-                query
+                query,
+                user_id: userId
             })
         });
 
         resultDiv.innerHTML = `<p>${formatResponse(result.response)}</p>`;
 
     } catch (error) {
-        resultDiv.innerHTML = '<p style="color: var(--accent-danger)">Error comparing articles. Please try again.</p>';
+        resultDiv.innerHTML = `<p class="error-text">Error comparing articles: ${escapeHtml(error.message)}</p>`;
     }
 }
 
@@ -462,7 +517,8 @@ function connectWebSocket() {
     const statusText = document.getElementById('connection-status');
 
     try {
-        wsConnection = new WebSocket(`ws://${window.location.host}/ws/feed`);
+        const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        wsConnection = new WebSocket(`${scheme}://${window.location.host}/ws/feed`);
 
         wsConnection.onopen = () => {
             statusDot.classList.add('connected');
@@ -473,7 +529,9 @@ function connectWebSocket() {
             if (event.data !== 'pong') {
                 const data = JSON.parse(event.data);
                 if (data.type === 'new_article') {
-                    loadNewsFeed();
+                    // Coalesce bursts of new articles into a single refresh.
+                    clearTimeout(feedReloadTimer);
+                    feedReloadTimer = setTimeout(() => { loadNewsFeed(); loadStats(); }, 1000);
                 }
             }
         };
@@ -553,10 +611,10 @@ async function fetchYouTubeVideos() {
             listDiv.innerHTML = '<p style="color: var(--text-secondary); text-align: center; padding: 1rem;">No related YouTube videos found</p>';
         } else {
             listDiv.innerHTML = currentYouTubeVideos.map((video, index) => `
-                <div class="youtube-video-card" onclick="selectVideo(${index})">
+                <div class="youtube-video-card" data-index="${index}">
                     <div class="video-thumbnail">
                         ${video.thumbnail
-                    ? `<img src="${escapeHtml(video.thumbnail)}" alt="Video thumbnail" onerror="this.parentElement.innerHTML='<svg width=\\'24\\' height=\\'24\\' viewBox=\\'0 0 24 24\\' fill=\\'none\\' stroke=\\'currentColor\\' stroke-width=\\'2\\'><polygon points=\\'23 7 16 12 23 17 23 7\\'/><rect x=\\'1\\' y=\\'5\\' width=\\'15\\' height=\\'14\\' rx=\\'2\\' ry=\\'2\\'/></svg>'"/>`
+                    ? `<img src="${escapeHtml(video.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer"/>`
                     : `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>`
                 }
                     </div>
@@ -565,18 +623,31 @@ async function fetchYouTubeVideos() {
                         <div class="video-channel">${escapeHtml(video.channel)}</div>
                         ${video.duration ? `<div class="video-duration">${escapeHtml(video.duration)}</div>` : ''}
                     </div>
-                    <button class="video-analyze-btn" onclick="event.stopPropagation(); analyzeYouTubeVideo('${escapeHtml(video.url)}', '${escapeHtml(video.title)}')">
+                    <button type="button" class="video-analyze-btn" data-index="${index}" aria-label="Analyze video: ${escapeHtml(video.title)}">
                         Analyze
                     </button>
                 </div>
             `).join('');
+            listDiv.querySelectorAll('.youtube-video-card').forEach(card => {
+                card.addEventListener('click', () => selectVideo(Number(card.dataset.index)));
+            });
+            listDiv.querySelectorAll('.video-analyze-btn').forEach(button => {
+                button.addEventListener('click', (event) => {
+                    event.stopPropagation();
+                    const video = currentYouTubeVideos[Number(button.dataset.index)];
+                    if (video) analyzeYouTubeVideo(video.url, video.title);
+                });
+            });
+            listDiv.querySelectorAll('.video-thumbnail img').forEach(img => {
+                img.addEventListener('error', () => img.remove(), { once: true });
+            });
         }
 
         listDiv.style.display = 'flex';
 
     } catch (error) {
         console.error('YouTube search error:', error);
-        listDiv.innerHTML = '<p style="color: var(--accent-danger); text-align: center; padding: 1rem;">Error searching YouTube. Please try again.</p>';
+        listDiv.innerHTML = `<p class="error-text" style="text-align: center; padding: 1rem;">Error searching YouTube: ${escapeHtml(error.message)}</p>`;
         listDiv.style.display = 'flex';
     }
 
@@ -614,7 +685,8 @@ async function analyzeYouTubeVideo(videoUrl, videoTitle) {
             body: JSON.stringify({
                 video_url: videoUrl,
                 article_title: currentArticleTitle,
-                article_content: currentArticleContent
+                article_content: currentArticleContent,
+                video_title: videoTitle
             })
         });
 
@@ -625,7 +697,7 @@ async function analyzeYouTubeVideo(videoUrl, videoTitle) {
         console.error('YouTube analysis error:', error);
         loadingDiv.style.display = 'none';
         listDiv.style.display = 'flex';
-        showNotification('Error analyzing video. Make sure yt-dlp and ffmpeg are installed.', 'error');
+        showNotification(`Video analysis failed: ${error.message}`, 'error');
     }
 }
 
@@ -664,13 +736,46 @@ function displayYouTubeAnalysis(data) {
     showNotification('✅ Video analysis complete!');
 }
 
+function resetYouTubeSection() {
+    ['youtube-videos-list', 'youtube-analysis-loading', 'youtube-analysis-result'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = 'none';
+    });
+    const list = document.getElementById('youtube-videos-list');
+    if (list) list.innerHTML = '';
+    currentYouTubeVideos = [];
+}
+
 // ============ Utilities ============
 
+function renderSources(result) {
+    const docs = (result && result.context && result.context.documents) || [];
+    if (!docs.length) return '';
+    const items = docs.map(doc => {
+        const title = escapeHtml(truncate(doc.title || 'Untitled', 90));
+        const source = doc.source ? ` <span>(${escapeHtml(doc.source)})</span>` : '';
+        return safeUrl(doc.url)
+            ? `<li><a href="${escapeHtml(doc.url)}" target="_blank" rel="noopener noreferrer">${title}</a>${source}</li>`
+            : `<li>${title}${source}</li>`;
+    }).join('');
+    return `<div class="message-sources"><strong>Sources</strong><ul>${items}</ul></div>`;
+}
+
+function safeUrl(url) {
+    try {
+        const parsed = new URL(url);
+        return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+    } catch (_) {
+        return false;
+    }
+}
+
+const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+
+// Safe for both element content and quoted attribute values.
 function escapeHtml(text) {
-    if (!text) return '';
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+    if (text === null || text === undefined) return '';
+    return String(text).replace(/[&<>"']/g, ch => HTML_ESCAPES[ch]);
 }
 
 function truncate(text, length) {
@@ -705,6 +810,7 @@ function showNotification(message, type = 'success') {
         animation: slideIn 0.3s ease;
         box-shadow: var(--shadow-lg);
     `;
+    notification.setAttribute('role', type === 'error' ? 'alert' : 'status');
     notification.textContent = message;
     document.body.appendChild(notification);
 

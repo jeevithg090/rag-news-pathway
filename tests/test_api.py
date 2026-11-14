@@ -188,3 +188,31 @@ def test_services_create_uses_given_database(tmp_path):
     services.db.create_tables()
     assert (tmp_path / "x" / "db.sqlite").exists()
     services.shutdown()
+
+
+def test_unknown_page_returns_html_404_for_browsers(client):
+    response = client.get("/no-such-page", headers={"Accept": "text/html"})
+    assert response.status_code == 404
+    assert "Page not found" in response.text
+
+
+def test_unknown_api_route_keeps_json_404(client):
+    response = client.get("/api/no-such-route", headers={"Accept": "text/html"})
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not Found"}
+    assert client.get("/no-such-page").json() == {"detail": "Not Found"}
+
+
+def test_demo_mode_preloads_sample_articles(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from api.demo_data import DEMO_SOURCE
+    from api.main import create_app
+
+    services = Services.create(database_url=f"sqlite:///{tmp_path / 'demo.db'}")
+    with TestClient(create_app(services=services, enable_streaming=False, demo=True)) as demo_client:
+        articles = demo_client.get("/api/news/feed?limit=50").json()["articles"]
+        assert len(articles) >= 6
+        assert {a["source"] for a in articles} == {DEMO_SOURCE}
+        assert all(a["url"].startswith("https://example.com/") for a in articles)
+        assert all(a["topics"] for a in articles)

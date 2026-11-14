@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Page not found | Live AI News</title>
+    <meta name="description" content="This page does not exist on Live AI News.">
+    <meta name="robots" content="noindex">
+    <meta name="color-scheme" content="light dark">
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <script>
+        try {
+            const theme = localStorage.getItem('news_ai_theme');
+            if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme;
+        } catch (_) { /* storage unavailable */ }
+    </script>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+
+<body>
+    <main class="main" id="main-content">
+        <div class="empty-state not-found">
+            <div class="empty-icon" aria-hidden="true">
+                <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35M8 11h6" /></svg>
+            </div>
+            <p class="not-found-code">404</p>
+            <h1>Page not found</h1>
+            <p>The page you were looking for doesn't exist or has moved.</p>
+            <div class="empty-actions">
+                <a class="btn btn-primary" href="/">Back to the feed</a>
+                <a class="btn btn-secondary" href="/#chat">Ask the AI</a>
+            </div>
+        </div>
+    </main>
+</body>
+
+</html>

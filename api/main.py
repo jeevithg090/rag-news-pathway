@@ -15,12 +15,15 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from api.db_models import UserOnboarding
+from api.demo_data import demo_articles
 from api.schemas import (
     ArticleChatRequest,
     ChatQueryRequest,
@@ -41,6 +44,7 @@ logger = logging.getLogger(__name__)
 APP_VERSION = "1.1.0"
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
 ONBOARDING_DIST = FRONTEND_DIR / "onboarding-app" / "dist"
+NOT_FOUND_PAGE = FRONTEND_DIR / "404.html"
 USER_ID_PATTERN = r"^[A-Za-z0-9_.:-]{1,64}$"
 
 
@@ -58,15 +62,29 @@ def require_admin(x_admin_token: Annotated[str | None, Header()] = None) -> None
         raise HTTPException(status_code=401, detail="Invalid admin token")
 
 
-def create_app(services: Services | None = None, enable_streaming: bool | None = None) -> FastAPI:
-    """Application factory. Tests pass their own ``services``; production builds the defaults."""
+def create_app(
+    services: Services | None = None,
+    enable_streaming: bool | None = None,
+    demo: bool | None = None,
+) -> FastAPI:
+    """
+    Application factory. Tests pass their own ``services``; production builds the defaults.
+
+    ``demo`` (or ``DEMO_MODE``) pre-loads fictional sample articles so the UI can be explored
+    without any API keys.
+    """
     streaming = Config.NEWS_STREAMING_ENABLED if enable_streaming is None else enable_streaming
+    load_demo = Config.DEMO_MODE if demo is None else demo
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         svc = services or Services.create()
         svc.db.create_tables()
         app.state.services = svc
+        if load_demo:
+            for article in demo_articles():
+                svc.store.add(article)
+            logger.info("Demo mode: loaded %d sample articles", len(svc.store))
         stream_task: asyncio.Task | None = None
         if streaming:
             if svc.news.api_key:
@@ -99,8 +117,22 @@ def create_app(services: Services | None = None, enable_streaming: bool | None =
     async def _missing_key(_: Request, exc: MissingAPIKeyError) -> JSONResponse:
         return JSONResponse(status_code=503, content={"detail": str(exc)})
 
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_error(request: Request, exc: StarletteHTTPException):
+        # Browsers navigating to an unknown page get the friendly HTML 404; API clients keep JSON.
+        if exc.status_code == 404 and _wants_html(request) and NOT_FOUND_PAGE.exists():
+            return FileResponse(NOT_FOUND_PAGE, status_code=404)
+        return await http_exception_handler(request, exc)
+
     _register_routes(app)
     return app
+
+
+def _wants_html(request: Request) -> bool:
+    path = request.url.path
+    if request.method != "GET" or path.startswith(("/api/", "/ws/", "/static/")):
+        return False
+    return "text/html" in request.headers.get("accept", "")
 
 
 def _article_or_404(services: Services, article_id: str) -> dict[str, Any]:

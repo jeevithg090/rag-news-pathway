@@ -2,7 +2,9 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 // https://vite.dev/config/
-export default defineConfig({
+export default defineConfig(({ command }) => ({
+  // Served by FastAPI under /onboarding/ in production builds.
+  base: command === 'build' ? '/onboarding/' : '/',
   plugins: [react()],
   server: {
     port: 3000,
@@ -13,4 +15,4 @@ export default defineConfig({
       }
     }
   }
-})
+}))

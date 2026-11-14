@@ -1,253 +1,185 @@
 """
-Pathway Document Pipeline.
-Handles real-time document ingestion, embedding, and indexing using Pathway.
+Pathway live indexing service.
+
+Streams news from Serper, scrapes each article and indexes it incrementally in a Pathway
+``DocumentStore``. The store is served over HTTP by Pathway's ``DocumentStoreServer``
+(``POST /v1/retrieve``, ``POST /v1/statistics``, ``POST /v1/inputs``), so new articles become
+retrievable as soon as they are scraped, without restarts or batch re-indexing.
+
+Run it next to the API and point the API at it::
+
+    python -m pipeline.document_pipeline            # BM25 (no embedding key required)
+    python -m pipeline.document_pipeline --retriever hybrid   # BM25 + embeddings (OPENAI_API_KEY)
+    PATHWAY_RETRIEVER_URL=http://127.0.0.1:8765 python app.py
 """
 
+from __future__ import annotations
+
+import argparse
+import asyncio
 import logging
-from datetime import datetime
-from typing import Dict, Any, Optional, List
-import json
+import os
+import time
+from typing import Any
 
 import pathway as pw
+from pathway.stdlib.indexing import BruteForceKnnFactory, HybridIndexFactory, TantivyBM25Factory
 from pathway.xpacks.llm.document_store import DocumentStore
-from pathway.xpacks.llm.embedders import OpenAIEmbedder
-from pathway.xpacks.llm.splitters import TokenCountSplitter
 
 from config import Config
 
 logger = logging.getLogger(__name__)
 
+RETRIEVERS = ("bm25", "knn", "hybrid")
+METADATA_FIELDS = ("article_id", "url", "title", "source", "category", "publish_date", "topics")
+
 
 class NewsArticleSchema(pw.Schema):
-    """Schema for news articles in Pathway"""
     article_id: str = pw.column_definition(primary_key=True)
     url: str
     title: str
     content: str
-    author: Optional[str]
-    publish_date: Optional[str]
     source: str
     category: str
-    topics: str  # JSON-encoded list
-    scraped_at: str
+    publish_date: str | None
+    topics: list[str]
 
 
-class ArticleChunkSchema(pw.Schema):
-    """Schema for chunked articles"""
-    chunk_id: str = pw.column_definition(primary_key=True)
-    article_id: str
-    chunk_index: int
-    text: str
-    metadata: str  # JSON-encoded metadata
-
-
-class PathwayDocumentPipeline:
-    """
-    Pathway-based document processing pipeline.
-    Handles:
-    - Continuous document ingestion
-    - Text chunking
-    - Embedding generation
-    - Vector indexing
-    """
-    
-    def __init__(
-        self,
-        openai_api_key: str = None,
-        embedding_model: str = None,
-        chunk_size: int = None,
-        chunk_overlap: int = None
-    ):
-        self.openai_api_key = openai_api_key or Config.OPENROUTER_API_KEY
-        self.embedding_model = embedding_model or Config.EMBEDDING_MODEL
-        self.chunk_size = chunk_size or Config.RAG_CHUNK_SIZE
-        self.chunk_overlap = chunk_overlap or Config.RAG_CHUNK_OVERLAP
-        
-        # Initialize embedder
-        self._embedder = OpenAIEmbedder(
-            api_key=self.openai_api_key,
-            model=self.embedding_model,
-        )
-        
-        # Initialize text splitter
-        self._splitter = TokenCountSplitter(
-            max_tokens=self.chunk_size // 4,  # Rough token estimate
-            overlap=self.chunk_overlap // 4
-        )
-        
-        # Document store will be initialized with the pipeline
-        self._document_store: Optional[DocumentStore] = None
-        self._articles_table: Optional[pw.Table] = None
-        
-        logger.info(f"Document pipeline initialized with model: {self.embedding_model}")
-    
-    def create_article_input_connector(self):
-        """
-        Create a Pathway input connector for articles.
-        Uses a Python connector that accepts data programmatically.
-        """
-        # Create a Python connector that can receive data
-        class ArticleInputConnector(pw.io.python.ConnectorSubject):
-            def __init__(self):
-                super().__init__()
-                self._buffer: List[Dict] = []
-            
-            def add_article(self, article: Dict[str, Any]):
-                """Add an article to the stream"""
-                topics_json = json.dumps(article.get("topics", []))
-                
-                data = {
-                    "article_id": article.get("article_id", ""),
-                    "url": article.get("url", ""),
-                    "title": article.get("title", ""),
-                    "content": article.get("content", ""),
-                    "author": article.get("author"),
-                    "publish_date": article.get("publish_date"),
-                    "source": article.get("source", ""),
-                    "category": article.get("category", ""),
-                    "topics": topics_json,
-                    "scraped_at": article.get("scraped_at", datetime.utcnow().isoformat())
-                }
-                self.next(**data)
-            
-            def run(self):
-                """Required by ConnectorSubject"""
-                # Keep running indefinitely
-                import time
-                while True:
-                    time.sleep(1)
-        
-        return ArticleInputConnector()
-    
-    def build_pipeline(self, input_connector) -> pw.Table:
-        """
-        Build the Pathway document processing pipeline.
-        
-        Args:
-            input_connector: ArticleInputConnector instance
-        
-        Returns:
-            Pathway table with processed documents
-        """
-        # Create input table from connector
-        articles = pw.io.python.read(
-            input_connector,
-            schema=NewsArticleSchema
-        )
-        
-        self._articles_table = articles
-        
-        # Transform: Create text for embedding
-        articles_with_text = articles.select(
-            *articles,
-            embedding_text=pw.apply(
-                lambda title, content: f"{title}\n\n{content}",
-                articles.title,
-                articles.content
-            ),
-            metadata_json=pw.apply(
-                lambda article_id, url, category, source, topics: json.dumps({
-                    "article_id": article_id,
-                    "url": url,
-                    "category": category,
-                    "source": source,
-                    "topics": json.loads(topics) if topics else []
-                }),
-                articles.article_id,
-                articles.url,
-                articles.category,
-                articles.source,
-                articles.topics
-            )
-        )
-        
-        logger.info("Built article ingestion pipeline")
-        return articles_with_text
-    
-    def create_document_store(
-        self,
-        articles_table: pw.Table,
-        index_type: str = "hybrid"  # "vector", "text", or "hybrid"
-    ) -> DocumentStore:
-        """
-        Create a Pathway DocumentStore from articles table.
-        
-        Args:
-            articles_table: Processed articles table
-            index_type: Type of index to use
-        
-        Returns:
-            DocumentStore instance
-        """
-        # Create document store with hybrid indexing
-        self._document_store = DocumentStore(
-            documents=articles_table,
-            embedder=self._embedder,
-            splitter=self._splitter,
-            # Use text column for content
-            text_column="embedding_text",
-            metadata_column="metadata_json",
-        )
-        
-        logger.info(f"Created DocumentStore with {index_type} indexing")
-        return self._document_store
-    
-    def get_document_store(self) -> Optional[DocumentStore]:
-        """Get the document store instance"""
-        return self._document_store
-    
-    def query_documents(
-        self,
-        query: str,
-        top_k: int = None,
-        metadata_filter: str = None
-    ) -> pw.Table:
-        """
-        Query the document store.
-        
-        Args:
-            query: Search query
-            top_k: Number of results
-            metadata_filter: Optional metadata filter expression
-        
-        Returns:
-            Table of matching documents
-        """
-        if self._document_store is None:
-            raise RuntimeError("Document store not initialized")
-        
-        top_k = top_k or Config.RAG_TOP_K
-        
-        return self._document_store.query(
-            query=query,
-            k=top_k,
-            metadata_filter=metadata_filter
-        )
-
-
-def create_full_pipeline():
-    """
-    Create the complete document processing pipeline.
-    Returns the pipeline object and input connector.
-    """
-    pipeline = PathwayDocumentPipeline()
-    input_connector = pipeline.create_article_input_connector()
-    articles_table = pipeline.build_pipeline(input_connector)
-    document_store = pipeline.create_document_store(articles_table)
-    
+def article_to_row(article: dict[str, Any]) -> dict[str, Any]:
+    """Project an article dict onto :class:`NewsArticleSchema`."""
     return {
-        "pipeline": pipeline,
-        "input_connector": input_connector,
-        "articles_table": articles_table,
-        "document_store": document_store
+        "article_id": article["article_id"],
+        "url": article.get("url") or "",
+        "title": article.get("title") or "",
+        "content": article.get("content") or "",
+        "source": article.get("source") or "",
+        "category": article.get("category") or "",
+        "publish_date": article.get("publish_date"),
+        "topics": list(article.get("topics") or []),
     }
 
 
+@pw.udf
+def _document_bytes(title: str, content: str) -> bytes:
+    return f"{title}\n\n{content}".encode()
+
+
+@pw.udf
+def _document_metadata(
+    article_id: str, url: str, title: str, source: str, category: str, publish_date: str | None, topics: list[str]
+) -> pw.Json:
+    return pw.Json(
+        {
+            "article_id": article_id,
+            "url": url,
+            "title": title,
+            "source": source,
+            "category": category,
+            "publish_date": publish_date,
+            "topics": list(topics),
+        }
+    )
+
+
+def articles_to_documents(articles: pw.Table) -> pw.Table:
+    """Convert an articles table into the ``data`` / ``_metadata`` layout DocumentStore expects."""
+    return articles.select(
+        data=_document_bytes(pw.this.title, pw.this.content),
+        _metadata=_document_metadata(*(pw.this[name] for name in METADATA_FIELDS)),
+    )
+
+
+def make_retriever_factory(kind: str = "bm25", embedder: pw.UDF | None = None):
+    """Build a Pathway retriever factory: ``bm25``, ``knn`` or ``hybrid`` (BM25 + kNN, RRF fused)."""
+    if kind not in RETRIEVERS:
+        raise ValueError(f"retriever must be one of {RETRIEVERS}")
+    if kind == "bm25":
+        return TantivyBM25Factory()
+    if embedder is None:
+        from pathway.xpacks.llm.embedders import OpenAIEmbedder
+
+        embedder = OpenAIEmbedder(model=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"))
+    knn = BruteForceKnnFactory(embedder=embedder)
+    return knn if kind == "knn" else HybridIndexFactory([TantivyBM25Factory(), knn])
+
+
+def build_document_store(
+    articles: pw.Table,
+    retriever: str = "bm25",
+    embedder: pw.UDF | None = None,
+    chunk: bool = True,
+) -> DocumentStore:
+    """
+    Index ``articles`` in a Pathway DocumentStore.
+
+    With ``chunk=True`` articles are split into ~400-token chunks (needs ``tiktoken``, which
+    downloads its encoding on first use); with ``chunk=False`` each article is one document.
+    """
+    splitter = None
+    if chunk:
+        from pathway.xpacks.llm.splitters import TokenCountSplitter
+
+        splitter = TokenCountSplitter(min_tokens=50, max_tokens=400)
+    return DocumentStore(
+        articles_to_documents(articles),
+        retriever_factory=make_retriever_factory(retriever, embedder),
+        splitter=splitter,
+    )
+
+
+class NewsStreamSubject(pw.io.python.ConnectorSubject):
+    """Pathway input connector that polls Serper and pushes scraped articles into the stream."""
+
+    def __init__(self, interval_seconds: int | None = None, max_cycles: int | None = None):
+        super().__init__()
+        self.interval = interval_seconds or Config.NEWS_FETCH_INTERVAL_SECONDS
+        self.max_cycles = max_cycles
+
+    async def _fetch_cycle(self, connector, scraper) -> int:
+        results = await connector.fetch_all_categories()
+        articles = await scraper.scrape_articles(
+            [{"url": r.url, "category": r.category, "source": r.source} for r in results]
+        )
+        for article in articles:
+            self.next(**article_to_row(article.to_dict()))
+        return len(articles)
+
+    def run(self) -> None:
+        from connectors.article_scraper import ArticleScraper
+        from connectors.news_connector import SerperNewsConnector
+
+        connector = SerperNewsConnector()
+        scraper = ArticleScraper()
+        cycles = 0
+        try:
+            while self.max_cycles is None or cycles < self.max_cycles:
+                indexed = asyncio.run(self._fetch_cycle(connector, scraper))
+                logger.info("Pushed %d articles into Pathway", indexed)
+                cycles += 1
+                if self.max_cycles is None or cycles < self.max_cycles:
+                    time.sleep(self.interval)
+        finally:
+            scraper.shutdown()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Pathway live news indexing server")
+    parser.add_argument("--host", default=Config.PATHWAY_HOST)
+    parser.add_argument("--port", type=int, default=Config.PATHWAY_PORT)
+    parser.add_argument("--retriever", choices=RETRIEVERS, default="bm25")
+    parser.add_argument("--no-chunking", action="store_true", help="index whole articles instead of chunks")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=Config.LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if not Config.SERPER_API_KEY:
+        raise SystemExit("SERPER_API_KEY is required to stream news into Pathway")
+
+    from pathway.xpacks.llm.servers import DocumentStoreServer
+
+    articles = pw.io.python.read(NewsStreamSubject(), schema=NewsArticleSchema)
+    store = build_document_store(articles, retriever=args.retriever, chunk=not args.no_chunking)
+    DocumentStoreServer(host=args.host, port=args.port, document_store=store).run(with_cache=False)
+
+
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    
-    # Test pipeline creation
-    print("Creating Pathway document pipeline...")
-    components = create_full_pipeline()
-    print("Pipeline created successfully!")
-    print(f"Components: {list(components.keys())}")
+    main()

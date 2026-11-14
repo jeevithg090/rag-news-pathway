@@ -33,3 +33,9 @@ def test_search_ignores_stopword_only_queries(store):
 
 def test_search_respects_top_k(store):
     assert len(store.search("electric vehicle market", top_k=1)) == 1
+
+
+def test_search_matches_category_name(store):
+    # "finance" appears in no title, topic or body, only as the category of the markets article.
+    results = store.search("latest finance news")
+    assert [doc["article_id"] for doc in results] == ["mkt001"]

@@ -67,7 +67,8 @@ class ArticleStore:
         """
         Rank articles by keyword overlap with ``query``.
 
-        Title hits count double, topic hits count triple, body hits count once per distinct
+        Title hits count double, topic hits count triple, a hit on the article's category
+        ("technology", "finance", ...) counts double, and body hits count once per distinct
         term (with a small bonus for frequency). Articles with zero score are dropped.
         """
         terms = set(tokenize(query))
@@ -85,6 +86,7 @@ class ArticleStore:
 
             title_tokens = set(tokenize(doc.get("title") or ""))
             topic_tokens = {tok for topic in doc.get("topics", []) for tok in tokenize(topic)}
+            category_tokens = set(tokenize(doc.get("category") or ""))
             body_counts = Counter(tokenize(doc.get("content") or ""))
 
             score = 0.0
@@ -92,6 +94,8 @@ class ArticleStore:
                 if term in topic_tokens:
                     score += 3
                 if term in title_tokens:
+                    score += 2
+                if term in category_tokens:
                     score += 2
                 if body_counts.get(term):
                     score += 1 + min(body_counts[term], 10) * 0.05

@@ -1,361 +1,188 @@
 """
-Recommendation Engine.
-Provides personalized article recommendations based on user preferences.
+Recommendation engine.
+
+Ranks articles for a user from their preference scores, finds related articles by topic
+overlap, and suggests head-to-head comparisons (e.g. Tesla vs BMW).
 """
 
-import json
-import logging
-from datetime import datetime
-from typing import Dict, Any, Optional, List, Tuple
-from dataclasses import dataclass, asdict
+from __future__ import annotations
 
-from config import Config
-from user.user_profile import UserProfileManager, get_profile_manager
+import logging
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
+from typing import Any
+
+from rag.article_store import ArticleStore
+from user.user_profile import BASE_SCORE, UserProfileManager
+from utils import parse_datetime, utcnow
 
 logger = logging.getLogger(__name__)
+
+_ONE_DAY = timedelta(hours=24)
+
+# Pairs of topic groups worth comparing against each other.
+COMPARISON_PAIRS: list[tuple[list[str], list[str]]] = [
+    (["Tesla"], ["BMW", "Mercedes", "Ford", "Toyota"]),
+    (["Apple", "iPhone"], ["Samsung", "Google"]),
+    (["Microsoft"], ["Apple", "Google"]),
+    (["Amazon"], ["Google", "Microsoft"]),
+    (["bitcoin", "crypto"], ["stock", "bank"]),
+]
 
 
 @dataclass
 class ArticleRecommendation:
-    """Represents an article recommendation"""
     article_id: str
     title: str
     score: float
-    reasons: List[str]
+    reasons: list[str]
     category: str
-    topics: List[str]
+    topics: list[str]
+    source: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass
 class ComparisonSuggestion:
-    """Suggestion for article comparison"""
-    article_ids: List[str]
-    titles: List[str]
-    common_topics: List[str]
+    article_ids: list[str]
+    titles: list[str]
+    common_topics: list[str]
     comparison_prompt: str
 
 
+def _lower(items: list[str]) -> set[str]:
+    return {item.lower() for item in items}
+
+
 class RecommendationEngine:
-    """
-    Provides personalized recommendations based on user preferences.
-    Features:
-    - Personalized article ranking
-    - Smart comparison suggestions (Tesla vs BMW style)
-    - Topic-based clustering
-    """
-    
-    def __init__(self, profile_manager: UserProfileManager = None):
-        self.profile_manager = profile_manager or get_profile_manager()
-        
-        # In-memory article store (shared with RAG engine)
-        self._articles: Dict[str, Dict[str, Any]] = {}
-        
-        # Comparison topic pairs (for smart suggestions)
-        self._comparison_pairs = [
-            (["Tesla", "EV"], ["BMW", "Mercedes", "Audi"]),
-            (["Apple", "iPhone"], ["Samsung", "Google", "Android"]),
-            (["Microsoft", "Windows"], ["Apple", "Mac"]),
-            (["Amazon", "AWS"], ["Google Cloud", "Azure"]),
-            (["Facebook", "Meta"], ["Twitter", "X", "TikTok"]),
-        ]
-        
-        logger.info("Recommendation engine initialized")
-    
-    def add_article(self, article: Dict[str, Any]):
-        """Add an article to the recommendation pool"""
-        article_id = article.get("article_id")
-        if article_id:
-            self._articles[article_id] = article
-    
-    def _score_article_for_user(
-        self,
-        article: Dict[str, Any],
-        user_id: str
-    ) -> Tuple[float, List[str]]:
-        """
-        Score an article for a specific user based on preferences.
-        
-        Returns:
-            Tuple of (score, reasons)
-        """
+    def __init__(self, store: ArticleStore, profile_manager: UserProfileManager):
+        self.store = store
+        self.profile_manager = profile_manager
+
+    def score_article(
+        self, article: dict[str, Any], user_id: str, now: datetime | None = None
+    ) -> tuple[float, list[str]]:
+        """Score an article in ``[0, 1]`` for a user and explain why."""
         user = self.profile_manager.get_user(user_id)
         if not user:
-            return 0.5, ["No user profile"]
-        
-        score = 0.5  # Base score
-        reasons = []
-        
+            return BASE_SCORE, []
+
+        score = BASE_SCORE
+        reasons: list[str] = []
+
         category = article.get("category", "")
-        topics = article.get("topics", [])
-        if isinstance(topics, str):
-            topics = json.loads(topics) if topics else []
-        
-        # Category preference
-        cat_pref = user.category_preferences.get(category, 0.5)
+        cat_pref = user.category_preferences.get(category, BASE_SCORE)
         if cat_pref > 0.6:
-            score += (cat_pref - 0.5) * 0.5
+            score += (cat_pref - BASE_SCORE) * 0.5
             reasons.append(f"Interested in {category}")
-        
-        # Topic preferences
-        topic_boost = 0
-        matched_topics = []
-        for topic in topics:
-            topic_pref = user.topic_preferences.get(topic, 0)
-            if topic_pref > 0.5:
-                topic_boost += topic_pref * 0.1
-                matched_topics.append(topic)
-        
-        if matched_topics:
-            score += min(topic_boost, 0.3)  # Cap topic boost
-            reasons.append(f"Matches interests: {', '.join(matched_topics[:3])}")
-        
-        # Recency bonus
-        publish_date = article.get("publish_date")
-        if publish_date:
-            try:
-                pub_dt = datetime.fromisoformat(publish_date.replace("Z", "+00:00"))
-                hours_old = (datetime.utcnow() - pub_dt.replace(tzinfo=None)).total_seconds() / 3600
-                if hours_old < 24:
-                    score += 0.1
-                    reasons.append("Fresh news")
-            except:
-                pass
-        
-        # Novelty penalty (already viewed)
-        article_id = article.get("article_id", "")
-        if article_id in user.viewed_articles:
+
+        matched = [t for t in article.get("topics", []) if user.topic_preferences.get(t, 0) > BASE_SCORE]
+        if matched:
+            score += min(sum(user.topic_preferences[t] * 0.1 for t in matched), 0.3)
+            reasons.append(f"Matches interests: {', '.join(matched[:3])}")
+
+        published = parse_datetime(article.get("publish_date"))
+        if published and (now or utcnow()) - published < _ONE_DAY:
+            score += 0.1
+            reasons.append("Fresh news")
+
+        if article.get("article_id") in user.viewed_articles:
             score -= 0.2
             reasons.append("Already viewed")
-        
-        return min(1.0, max(0.0, score)), reasons
-    
+
+        return round(min(1.0, max(0.0, score)), 4), reasons
+
     def get_personalized_feed(
-        self,
-        user_id: str,
-        limit: int = 20,
-        exclude_viewed: bool = True
-    ) -> List[ArticleRecommendation]:
-        """
-        Get personalized article feed for a user.
-        
-        Args:
-            user_id: User identifier
-            limit: Max articles to return
-            exclude_viewed: Whether to exclude already viewed articles
-        
-        Returns:
-            List of ArticleRecommendation sorted by score
-        """
+        self, user_id: str, limit: int = 20, exclude_viewed: bool = True
+    ) -> list[ArticleRecommendation]:
         user = self.profile_manager.get_or_create_user(user_id)
-        
         recommendations = []
-        
-        for article_id, article in self._articles.items():
-            # Skip viewed if requested
-            if exclude_viewed and article_id in user.viewed_articles:
+        for article in self.store.all():
+            if exclude_viewed and article["article_id"] in user.viewed_articles:
                 continue
-            
-            score, reasons = self._score_article_for_user(article, user_id)
-            
-            topics = article.get("topics", [])
-            if isinstance(topics, str):
-                topics = json.loads(topics) if topics else []
-            
-            rec = ArticleRecommendation(
-                article_id=article_id,
-                title=article.get("title", "Untitled"),
-                score=score,
-                reasons=reasons,
-                category=article.get("category", ""),
-                topics=topics
-            )
-            recommendations.append(rec)
-        
-        # Sort by score descending
-        recommendations.sort(key=lambda x: x.score, reverse=True)
-        
-        return recommendations[:limit]
-    
-    def get_related_articles(
-        self,
-        article_id: str,
-        limit: int = 5
-    ) -> List[ArticleRecommendation]:
-        """
-        Get articles related to a specific article.
-        Used for "You might also like" suggestions.
-        """
-        source_article = self._articles.get(article_id)
-        if not source_article:
-            return []
-        
-        source_topics = source_article.get("topics", [])
-        if isinstance(source_topics, str):
-            source_topics = json.loads(source_topics) if source_topics else []
-        source_topics_set = set(t.lower() for t in source_topics)
-        
-        source_category = source_article.get("category", "").lower()
-        
-        scored_articles = []
-        
-        for aid, article in self._articles.items():
-            if aid == article_id:
-                continue
-            
-            topics = article.get("topics", [])
-            if isinstance(topics, str):
-                topics = json.loads(topics) if topics else []
-            topics_set = set(t.lower() for t in topics)
-            
-            # Calculate similarity score
-            topic_overlap = len(source_topics_set & topics_set)
-            category_match = 1 if article.get("category", "").lower() == source_category else 0
-            
-            score = topic_overlap * 0.3 + category_match * 0.2
-            
-            if score > 0:
-                reasons = []
-                if topic_overlap:
-                    common = source_topics_set & topics_set
-                    reasons.append(f"Common topics: {', '.join(list(common)[:3])}")
-                if category_match:
-                    reasons.append(f"Same category: {source_category}")
-                
-                rec = ArticleRecommendation(
-                    article_id=aid,
-                    title=article.get("title", "Untitled"),
+            score, reasons = self.score_article(article, user_id)
+            recommendations.append(
+                ArticleRecommendation(
+                    article_id=article["article_id"],
+                    title=article.get("title") or "Untitled",
                     score=score,
                     reasons=reasons,
                     category=article.get("category", ""),
-                    topics=topics
+                    topics=article.get("topics", []),
+                    source=article.get("source", ""),
                 )
-                scored_articles.append(rec)
-        
-        scored_articles.sort(key=lambda x: x.score, reverse=True)
-        return scored_articles[:limit]
-    
-    def suggest_comparison(
-        self,
-        article_id: str
-    ) -> Optional[ComparisonSuggestion]:
-        """
-        Suggest a comparison for a given article.
-        E.g., if user is reading Tesla news, suggest comparing with BMW.
-        """
-        source_article = self._articles.get(article_id)
-        if not source_article:
-            return None
-        
-        source_topics = source_article.get("topics", [])
-        if isinstance(source_topics, str):
-            source_topics = json.loads(source_topics) if source_topics else []
-        source_topics_lower = [t.lower() for t in source_topics]
-        
-        # Find matching comparison pair
-        target_topics = []
-        for group_a, group_b in self._comparison_pairs:
-            group_a_lower = [t.lower() for t in group_a]
-            group_b_lower = [t.lower() for t in group_b]
-            
-            if any(t in group_a_lower for t in source_topics_lower):
-                target_topics = group_b
-                break
-            elif any(t in group_b_lower for t in source_topics_lower):
-                target_topics = group_a
-                break
-        
-        if not target_topics:
-            return None
-        
-        # Find articles matching target topics
-        for aid, article in self._articles.items():
-            if aid == article_id:
+            )
+        # Stable sort keeps newest-first among equal scores.
+        recommendations.sort(key=lambda rec: rec.score, reverse=True)
+        return recommendations[:limit]
+
+    def get_related_articles(self, article_id: str, limit: int = 5) -> list[ArticleRecommendation]:
+        source = self.store.get(article_id)
+        if not source:
+            return []
+        source_topics = _lower(source.get("topics", []))
+        source_category = (source.get("category") or "").lower()
+
+        related = []
+        for article in self.store.all():
+            if article["article_id"] == article_id:
                 continue
-            
-            topics = article.get("topics", [])
-            if isinstance(topics, str):
-                topics = json.loads(topics) if topics else []
-            
-            if any(t.lower() in [tt.lower() for tt in topics] for t in target_topics):
-                # Found a match!
-                common = set(source_topics) & set(topics)
-                
-                return ComparisonSuggestion(
-                    article_ids=[article_id, aid],
-                    titles=[source_article.get("title", ""), article.get("title", "")],
-                    common_topics=list(common),
-                    comparison_prompt=f"Compare these two articles about related topics"
+            common = source_topics & _lower(article.get("topics", []))
+            same_category = bool(source_category) and (article.get("category") or "").lower() == source_category
+            score = len(common) * 0.3 + (0.2 if same_category else 0.0)
+            if score <= 0:
+                continue
+            reasons = []
+            if common:
+                reasons.append(f"Common topics: {', '.join(sorted(common)[:3])}")
+            if same_category:
+                reasons.append(f"Same category: {source.get('category')}")
+            related.append(
+                ArticleRecommendation(
+                    article_id=article["article_id"],
+                    title=article.get("title") or "Untitled",
+                    score=round(score, 4),
+                    reasons=reasons,
+                    category=article.get("category", ""),
+                    topics=article.get("topics", []),
+                    source=article.get("source", ""),
                 )
-        
+            )
+        related.sort(key=lambda rec: rec.score, reverse=True)
+        return related[:limit]
+
+    def suggest_comparison(self, article_id: str) -> ComparisonSuggestion | None:
+        """If the article mentions one side of a known rivalry, find an article about the other."""
+        source = self.store.get(article_id)
+        if not source:
+            return None
+        source_topics = _lower(source.get("topics", []))
+
+        targets: set[str] = set()
+        for group_a, group_b in COMPARISON_PAIRS:
+            if source_topics & _lower(group_a):
+                targets = _lower(group_b)
+                break
+            if source_topics & _lower(group_b):
+                targets = _lower(group_a)
+                break
+        if not targets:
+            return None
+
+        for article in self.store.all():
+            if article["article_id"] == article_id:
+                continue
+            topics = _lower(article.get("topics", []))
+            if topics & targets:
+                return ComparisonSuggestion(
+                    article_ids=[article_id, article["article_id"]],
+                    titles=[source.get("title", ""), article.get("title", "")],
+                    common_topics=sorted(source_topics & topics),
+                    comparison_prompt="Compare how these two articles cover related topics.",
+                )
         return None
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get engine statistics"""
-        return {
-            "total_articles": len(self._articles),
-            "comparison_pairs": len(self._comparison_pairs)
-        }
 
-
-# Singleton instance
-_recommendation_engine: Optional[RecommendationEngine] = None
-
-
-def get_recommendation_engine() -> RecommendationEngine:
-    """Get or create the recommendation engine instance"""
-    global _recommendation_engine
-    if _recommendation_engine is None:
-        _recommendation_engine = RecommendationEngine()
-    return _recommendation_engine
-
-
-async def test_recommendation_engine():
-    """Test the recommendation engine"""
-    engine = RecommendationEngine()
-    
-    # Add test articles
-    engine.add_article({
-        "article_id": "tesla_001",
-        "title": "Tesla Announces New Model Y",
-        "category": "Technology",
-        "topics": ["Tesla", "EV", "automotive"]
-    })
-    
-    engine.add_article({
-        "article_id": "bmw_001",
-        "title": "BMW Launches Electric iX Series",
-        "category": "Technology",
-        "topics": ["BMW", "EV", "automotive", "luxury"]
-    })
-    
-    engine.add_article({
-        "article_id": "apple_001",
-        "title": "Apple Unveils New iPhone",
-        "category": "Technology",
-        "topics": ["Apple", "iPhone", "smartphone"]
-    })
-    
-    # Test personalized feed
-    print("\n=== Personalized Feed ===")
-    feed = engine.get_personalized_feed("test_user")
-    for rec in feed:
-        print(f"  {rec.title} (score: {rec.score:.2f})")
-    
-    # Test related articles
-    print("\n=== Related to Tesla Article ===")
-    related = engine.get_related_articles("tesla_001")
-    for rec in related:
-        print(f"  {rec.title} - {rec.reasons}")
-    
-    # Test comparison suggestion
-    print("\n=== Comparison Suggestion ===")
-    suggestion = engine.suggest_comparison("tesla_001")
-    if suggestion:
-        print(f"  Compare: {suggestion.titles}")
-        print(f"  Prompt: {suggestion.comparison_prompt}")
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    import asyncio
-    asyncio.run(test_recommendation_engine())
+    def get_stats(self) -> dict[str, Any]:
+        return {"total_articles": len(self.store), "comparison_pairs": len(COMPARISON_PAIRS)}

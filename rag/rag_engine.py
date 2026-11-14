@@ -1,479 +1,303 @@
 """
-RAG Engine with Context Expansion.
-Handles queries with global, article-specific, and comparison contexts.
+RAG engine with three context modes:
+
+* **global** - retrieve across every indexed article (optionally from a Pathway DocumentStore),
+* **article** - focus on one article and expand context with topically related articles,
+* **comparison** - merge several chosen articles into one comparative prompt.
 """
 
-import asyncio
-import json
+from __future__ import annotations
+
 import logging
-from datetime import datetime
-from typing import Dict, Any, Optional, List
-from dataclasses import dataclass, asdict
-from openai import AsyncOpenAI
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+import httpx
 
 from config import Config
+from rag.article_store import ArticleStore
+from utils import utcnow_iso
 
 logger = logging.getLogger(__name__)
 
+GenerateFn = Callable[[str, str], Awaitable[str]]
 
-@dataclass 
-class RAGContext:
-    """Represents retrieved context for RAG"""
-    documents: List[Dict[str, Any]]
-    query: str
-    context_type: str  # "global", "article", "comparison"
-    metadata_filter: Optional[str] = None
-    total_tokens: int = 0
+NO_CONTEXT_MESSAGE = (
+    "I don't have any relevant news articles to answer this question yet. "
+    "Try a different query, or fetch more news first."
+)
+LLM_NOT_CONFIGURED_MESSAGE = (
+    "The language model is not configured. Set OPENROUTER_API_KEY to enable AI answers; "
+    "the retrieved articles are listed below."
+)
+LLM_ERROR_MESSAGE = "Sorry, the language model request failed. Please try again in a moment."
 
-
-@dataclass
-class RAGResponse:
-    """Response from RAG query"""
-    query: str
-    response: str
-    context: RAGContext
-    model: str
-    created_at: str
-    
-    def to_dict(self) -> Dict[str, Any]:
-        result = asdict(self)
-        result["context"]["documents"] = [
-            {"article_id": d.get("article_id"), "title": d.get("title"), "snippet": d.get("text", "")[:200]}
-            for d in self.context.documents
-        ]
-        return result
-
-
-class RAGEngine:
-    """
-    RAG Engine with multiple context modes:
-    - Global: Search all indexed articles
-    - Article-specific: Focus on one article + related topics  
-    - Comparison: Merge context from multiple articles
-    """
-    
-    def __init__(
-        self,
-        api_key: str = None,
-        base_url: str = None,
-        model: str = None
-    ):
-        self.api_key = api_key or Config.OPENROUTER_API_KEY
-        self.base_url = base_url or Config.LLM_BASE_URL
-        self.model = model or Config.LLM_MODEL
-        
-        # Initialize OpenAI client (works with OpenRouter)
-        self._client = AsyncOpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url
-        )
-        
-        # In-memory document store (before Pathway integration)
-        self._documents: Dict[str, Dict[str, Any]] = {}
-        
-        logger.info(f"RAG Engine initialized with model: {self.model}")
-    
-    def add_document(self, document: Dict[str, Any]):
-        """Add a document to the in-memory store"""
-        article_id = document.get("article_id")
-        if article_id:
-            self._documents[article_id] = document
-            logger.debug(f"Added document: {article_id}")
-    
-    def _simple_search(
-        self,
-        query: str,
-        top_k: int = 5,
-        category_filter: Optional[str] = None,
-        article_ids: Optional[List[str]] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Simple keyword-based search (placeholder for vector search).
-        Will be replaced with Pathway DocumentStore query.
-        """
-        query_lower = query.lower()
-        query_terms = query_lower.split()
-        
-        scored_docs = []
-        
-        for article_id, doc in self._documents.items():
-            # Apply article ID filter if specified
-            if article_ids and article_id not in article_ids:
-                continue
-            
-            # Apply category filter
-            if category_filter and doc.get("category", "").lower() != category_filter.lower():
-                continue
-            
-            # Simple term matching score
-            text = f"{doc.get('title', '')} {doc.get('content', '')}".lower()
-            topics = doc.get("topics", [])
-            if isinstance(topics, str):
-                topics = json.loads(topics) if topics else []
-            
-            score = sum(1 for term in query_terms if term in text)
-            score += sum(2 for term in query_terms if any(term in t.lower() for t in topics))
-            
-            if score > 0:
-                scored_docs.append((score, doc))
-        
-        # Sort by score and return top_k
-        scored_docs.sort(key=lambda x: x[0], reverse=True)
-        return [doc for _, doc in scored_docs[:top_k]]
-    
-    def _build_context_text(self, documents: List[Dict[str, Any]]) -> str:
-        """Build context text from retrieved documents"""
-        context_parts = []
-        
-        for i, doc in enumerate(documents, 1):
-            title = doc.get("title", "Untitled")
-            content = doc.get("content", "")[:2000]  # Limit content length
-            source = doc.get("source", "Unknown")
-            category = doc.get("category", "")
-            
-            context_parts.append(f"""
-Article {i}: {title}
-Source: {source} | Category: {category}
----
-{content}
----
-""")
-        
-        return "\n".join(context_parts)
-    
-    async def query_global(
-        self,
-        query: str,
-        top_k: int = None,
-        category: Optional[str] = None
-    ) -> RAGResponse:
-        """
-        Query with global context (all articles).
-        
-        Args:
-            query: User's question
-            top_k: Number of documents to retrieve
-            category: Optional category filter
-        
-        Returns:
-            RAGResponse with answer and context
-        """
-        top_k = top_k or Config.RAG_TOP_K
-        
-        # Retrieve relevant documents
-        documents = self._simple_search(
-            query=query,
-            top_k=top_k,
-            category_filter=category
-        )
-        
-        context = RAGContext(
-            documents=documents,
-            query=query,
-            context_type="global",
-            metadata_filter=f"category={category}" if category else None
-        )
-        
-        if not documents:
-            return RAGResponse(
-                query=query,
-                response="I don't have any relevant news articles to answer this question. Please try a different query or wait for more news to be indexed.",
-                context=context,
-                model=self.model,
-                created_at=datetime.utcnow().isoformat()
-            )
-        
-        # Build prompt
-        context_text = self._build_context_text(documents)
-        
-        system_prompt = """You are a knowledgeable AI news analyst. Your role is to answer questions about current news based on the provided article context.
+GLOBAL_SYSTEM_PROMPT = """You are a knowledgeable AI news analyst. Answer questions about current \
+news using the provided article context.
 
 Guidelines:
 - Base your answers primarily on the provided articles
 - If the articles don't contain enough information, say so
 - Mention specific sources when citing information
-- Be concise but informative
-- Highlight key points and developments"""
+- Be concise but informative and highlight key developments"""
 
-        user_prompt = f"""Based on the following news articles, please answer this question:
+ARTICLE_SYSTEM_PROMPT = """You are an AI assistant helping users understand news articles. Focus \
+primarily on the main article but reference related articles when relevant.
 
-**Question:** {query}
-
-**Context (Retrieved Articles):**
-{context_text}
-
-Please provide a comprehensive answer based on the articles above."""
-
-        # Generate response
-        response = await self._generate_response(system_prompt, user_prompt)
-        
-        return RAGResponse(
-            query=query,
-            response=response,
-            context=context,
-            model=self.model,
-            created_at=datetime.utcnow().isoformat()
-        )
-    
-    async def query_article(
-        self,
-        query: str,
-        article_id: str,
-        expand_context: bool = True,
-        top_k: int = 3
-    ) -> RAGResponse:
-        """
-        Query with article-specific context.
-        Optionally expands to related articles based on topics.
-        
-        Args:
-            query: User's question  
-            article_id: ID of the main article
-            expand_context: Whether to include related articles
-            top_k: Number of related articles to include
-        
-        Returns:
-            RAGResponse with answer and context
-        """
-        # Get the main article
-        main_article = self._documents.get(article_id)
-        
-        if not main_article:
-            return RAGResponse(
-                query=query,
-                response=f"Article with ID '{article_id}' not found.",
-                context=RAGContext(documents=[], query=query, context_type="article"),
-                model=self.model,
-                created_at=datetime.utcnow().isoformat()
-            )
-        
-        documents = [main_article]
-        
-        # Expand context with related articles
-        if expand_context:
-            topics = main_article.get("topics", [])
-            if isinstance(topics, str):
-                topics = json.loads(topics) if topics else []
-            
-            if topics:
-                # Search for related articles by topics
-                topic_query = " ".join(topics[:3])  # Use top 3 topics
-                related = self._simple_search(
-                    query=topic_query,
-                    top_k=top_k + 1  # +1 to account for main article
-                )
-                
-                # Add related articles (excluding main)
-                for doc in related:
-                    if doc.get("article_id") != article_id:
-                        documents.append(doc)
-                        if len(documents) > top_k + 1:
-                            break
-        
-        context = RAGContext(
-            documents=documents,
-            query=query,
-            context_type="article",
-            metadata_filter=f"article_id={article_id}"
-        )
-        
-        # Build prompt with emphasis on main article
-        main_context = self._build_context_text([main_article])
-        related_context = self._build_context_text(documents[1:]) if len(documents) > 1 else ""
-        
-        system_prompt = """You are an AI assistant helping users understand news articles. Focus primarily on the main article but reference related articles when relevant.
-
-Guidelines:  
+Guidelines:
 - Answer based on the main article first
 - Use related articles to provide additional context
 - If the user asks about something not in the articles, say so
 - Be conversational and helpful"""
 
-        user_prompt = f"""The user is reading the following news article and has a question:
-
-**MAIN ARTICLE:**
-{main_context}
-
-**RELATED ARTICLES (for context):**
-{related_context if related_context else "No related articles available."}
-
-**User's Question:** {query}
-
-Please answer based on the articles above, with emphasis on the main article."""
-
-        response = await self._generate_response(system_prompt, user_prompt)
-        
-        return RAGResponse(
-            query=query,
-            response=response,
-            context=context,
-            model=self.model,
-            created_at=datetime.utcnow().isoformat()
-        )
-    
-    async def query_comparison(
-        self,
-        query: str,
-        article_ids: List[str]
-    ) -> RAGResponse:
-        """
-        Query with comparison context (multiple articles merged).
-        Perfect for "compare Tesla vs BMW" type queries.
-        
-        Args:
-            query: User's comparison question
-            article_ids: IDs of articles to compare
-        
-        Returns:
-            RAGResponse with comparison analysis
-        """
-        # Get all specified articles
-        documents = []
-        missing_ids = []
-        
-        for article_id in article_ids:
-            article = self._documents.get(article_id)
-            if article:
-                documents.append(article)
-            else:
-                missing_ids.append(article_id)
-        
-        if not documents:
-            return RAGResponse(
-                query=query,
-                response="None of the specified articles were found.",
-                context=RAGContext(documents=[], query=query, context_type="comparison"),
-                model=self.model,
-                created_at=datetime.utcnow().isoformat()
-            )
-        
-        context = RAGContext(
-            documents=documents,
-            query=query,
-            context_type="comparison",
-            metadata_filter=f"article_ids={','.join(article_ids)}"
-        )
-        
-        # Build comparison prompt
-        articles_context = ""
-        for i, doc in enumerate(documents, 1):
-            articles_context += f"""
-**ARTICLE {i}: {doc.get('title', 'Untitled')}**
-Source: {doc.get('source', 'Unknown')} | Category: {doc.get('category', '')}
-Published: {doc.get('publish_date', 'Unknown date')}
-
-{doc.get('content', '')[:2500]}
-
----
-"""
-        
-        system_prompt = """You are an AI analyst specializing in comparative news analysis. Your task is to compare and contrast information from multiple news articles.
+COMPARISON_SYSTEM_PROMPT = """You are an AI analyst specialising in comparative news analysis. \
+Compare and contrast information from multiple news articles.
 
 Guidelines:
 - Identify key similarities and differences
 - Highlight important points from each article
-- Provide balanced analysis
-- Use specific details and quotes when relevant
+- Provide balanced analysis with specific details
 - Structure your comparison clearly"""
 
-        user_prompt = f"""Please analyze and compare the following articles:
 
-{articles_context}
+@dataclass
+class RAGContext:
+    """Documents retrieved for a query."""
 
-**Comparison Request:** {query}
+    documents: list[dict[str, Any]]
+    query: str
+    context_type: str  # "global", "article" or "comparison"
+    metadata_filter: str | None = None
+    retriever: str = "keyword"
 
-Provide a detailed comparison based on the articles above."""
 
-        if missing_ids:
-            user_prompt += f"\n\nNote: The following article IDs were not found: {', '.join(missing_ids)}"
-        
-        response = await self._generate_response(system_prompt, user_prompt)
-        
-        return RAGResponse(
-            query=query,
-            response=response,
-            context=context,
-            model=self.model,
-            created_at=datetime.utcnow().isoformat()
-        )
-    
-    async def _generate_response(self, system_prompt: str, user_prompt: str) -> str:
-        """Generate response using LLM"""
-        try:
-            response = await self._client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=Config.LLM_TEMPERATURE,
-                max_tokens=Config.LLM_MAX_TOKENS
-            )
-            
-            return response.choices[0].message.content
-            
-        except Exception as e:
-            logger.error(f"LLM error: {e}")
-            return f"Sorry, I encountered an error generating a response: {str(e)}"
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get engine statistics"""
+@dataclass
+class RAGResponse:
+    """Answer plus the context it was grounded on."""
+
+    query: str
+    response: str
+    context: RAGContext
+    model: str
+    created_at: str = field(default_factory=utcnow_iso)
+
+    def to_dict(self) -> dict[str, Any]:
         return {
-            "indexed_documents": len(self._documents),
+            "query": self.query,
+            "response": self.response,
             "model": self.model,
-            "base_url": self.base_url
+            "created_at": self.created_at,
+            "context": {
+                "query": self.context.query,
+                "context_type": self.context.context_type,
+                "metadata_filter": self.context.metadata_filter,
+                "retriever": self.context.retriever,
+                "documents": [
+                    {
+                        "article_id": doc.get("article_id"),
+                        "title": doc.get("title"),
+                        "source": doc.get("source"),
+                        "url": doc.get("url"),
+                        "snippet": (doc.get("content") or doc.get("text") or "")[:200],
+                    }
+                    for doc in self.context.documents
+                ],
+            },
         }
 
 
-# Singleton instance
-_rag_engine: Optional[RAGEngine] = None
+def build_context_text(documents: list[dict[str, Any]], max_chars: int | None = None) -> str:
+    """Render documents as numbered, delimited blocks for the prompt."""
+    max_chars = max_chars or Config.RAG_CONTEXT_CHARS
+    parts = []
+    for i, doc in enumerate(documents, 1):
+        parts.append(
+            f"Article {i}: {doc.get('title') or 'Untitled'}\n"
+            f"Source: {doc.get('source') or 'Unknown'} | Category: {doc.get('category') or ''}\n"
+            f"Published: {doc.get('publish_date') or 'Unknown date'}\n"
+            f"---\n{(doc.get('content') or '')[:max_chars]}\n---"
+        )
+    return "\n\n".join(parts)
 
 
-def get_rag_engine() -> RAGEngine:
-    """Get or create the RAG engine instance"""
-    global _rag_engine
-    if _rag_engine is None:
-        _rag_engine = RAGEngine()
-    return _rag_engine
+class PathwayRetriever:
+    """Client for a Pathway ``DocumentStoreServer`` (``POST /v1/retrieve``)."""
+
+    def __init__(self, base_url: str, store: ArticleStore, timeout: float = 10.0):
+        self.base_url = base_url.rstrip("/")
+        self.store = store
+        self.timeout = timeout
+
+    async def retrieve(self, query: str, k: int, category: str | None = None) -> list[dict[str, Any]]:
+        payload: dict[str, Any] = {"query": query, "k": k}
+        if category:
+            # JMESPath filter evaluated by Pathway against document metadata.
+            payload["metadata_filter"] = f"category == `{category}`"
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(f"{self.base_url}/v1/retrieve", json=payload)
+            response.raise_for_status()
+            hits = response.json()
+
+        documents: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for hit in hits:
+            metadata = hit.get("metadata") or {}
+            article_id = metadata.get("article_id")
+            if article_id in seen:
+                continue
+            if article_id:
+                seen.add(article_id)
+            # Prefer the full article if we have it locally; otherwise use the chunk.
+            local = self.store.get(article_id) if article_id else None
+            documents.append(local or {**metadata, "content": hit.get("text", "")})
+        return documents
 
 
-async def test_rag_engine():
-    """Test the RAG engine"""
-    engine = RAGEngine()
-    
-    # Add test documents
-    engine.add_document({
-        "article_id": "tesla_001",
-        "title": "Tesla Announces New Model Y Refresh",
-        "content": "Tesla has announced a major refresh of its popular Model Y electric vehicle. The new version features improved range of 350 miles, faster charging, and updated interior. CEO Elon Musk revealed the changes at a special event.",
-        "source": "TechNews",
-        "category": "Technology",
-        "topics": ["Tesla", "EV", "electric vehicle", "Model Y"]
-    })
-    
-    engine.add_document({
-        "article_id": "bmw_001", 
-        "title": "BMW Launches New Electric IX Series",
-        "content": "BMW has launched its new iX electric SUV series with advanced autonomous driving features. The vehicle offers 300 miles of range and luxury interior. BMW aims to compete directly with Tesla's Model X.",
-        "source": "AutoWorld",
-        "category": "Technology",
-        "topics": ["BMW", "EV", "electric vehicle", "iX", "autonomous"]
-    })
-    
-    print("Testing RAG Engine...")
-    
-    # Test global query
-    result = await engine.query_global("What's new in electric vehicles?")
-    print(f"\nGlobal Query Response:\n{result.response[:500]}...")
-    
-    # Test comparison
-    result = await engine.query_comparison(
-        "Compare Tesla and BMW's new electric vehicles",
-        ["tesla_001", "bmw_001"]
-    )
-    print(f"\nComparison Response:\n{result.response[:500]}...")
+class RAGEngine:
+    """Retrieval-augmented question answering over the shared article store."""
 
+    def __init__(
+        self,
+        store: ArticleStore,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        model: str | None = None,
+        generate: GenerateFn | None = None,
+        pathway_url: str | None = None,
+    ):
+        self.store = store
+        self.api_key = api_key if api_key is not None else Config.OPENROUTER_API_KEY
+        self.base_url = base_url or Config.LLM_BASE_URL
+        self.model = model or Config.LLM_MODEL
+        self._generate_override = generate
+        self._client = None
+        pathway_url = pathway_url if pathway_url is not None else Config.PATHWAY_RETRIEVER_URL
+        self.pathway = PathwayRetriever(pathway_url, store) if pathway_url else None
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(test_rag_engine())
+    # ------------------------------------------------------------------ LLM
+    @property
+    def llm_configured(self) -> bool:
+        return self._generate_override is not None or bool(self.api_key)
+
+    def _get_client(self):
+        if self._client is None:
+            from openai import AsyncOpenAI
+
+            self._client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url, timeout=Config.LLM_TIMEOUT_SECONDS)
+        return self._client
+
+    async def _generate(self, system_prompt: str, user_prompt: str) -> str:
+        if self._generate_override is not None:
+            return await self._generate_override(system_prompt, user_prompt)
+        if not self.api_key:
+            return LLM_NOT_CONFIGURED_MESSAGE
+        try:
+            completion = await self._get_client().chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=Config.LLM_TEMPERATURE,
+                max_tokens=Config.LLM_MAX_TOKENS,
+            )
+            return completion.choices[0].message.content or ""
+        except Exception:
+            logger.exception("LLM request failed")
+            return LLM_ERROR_MESSAGE
+
+    def _response(self, query: str, answer: str, context: RAGContext) -> RAGResponse:
+        return RAGResponse(query=query, response=answer, context=context, model=self.model)
+
+    # ------------------------------------------------------------ retrieval
+    async def retrieve(self, query: str, top_k: int, category: str | None = None) -> tuple[list[dict], str]:
+        """Retrieve from Pathway when configured (falling back to keywords on error)."""
+        if self.pathway is not None:
+            try:
+                return await self.pathway.retrieve(query, top_k, category), "pathway"
+            except (httpx.HTTPError, ValueError) as exc:
+                logger.warning("Pathway retrieval failed, using keyword search: %s", exc)
+        return self.store.search(query, top_k=top_k, category=category), "keyword"
+
+    # -------------------------------------------------------------- queries
+    async def query_global(self, query: str, top_k: int | None = None, category: str | None = None) -> RAGResponse:
+        top_k = top_k or Config.RAG_TOP_K
+        documents, retriever = await self.retrieve(query, top_k, category)
+        context = RAGContext(
+            documents=documents,
+            query=query,
+            context_type="global",
+            metadata_filter=f"category={category}" if category else None,
+            retriever=retriever,
+        )
+        if not documents:
+            return self._response(query, NO_CONTEXT_MESSAGE, context)
+
+        user_prompt = (
+            "Based on the following news articles, answer this question.\n\n"
+            f"**Question:** {query}\n\n"
+            f"**Context (retrieved articles):**\n{build_context_text(documents)}"
+        )
+        return self._response(query, await self._generate(GLOBAL_SYSTEM_PROMPT, user_prompt), context)
+
+    async def query_article(
+        self, query: str, article_id: str, expand_context: bool = True, top_k: int = 3
+    ) -> RAGResponse:
+        main_article = self.store.get(article_id)
+        if not main_article:
+            context = RAGContext(documents=[], query=query, context_type="article")
+            return self._response(query, f"Article with ID '{article_id}' not found.", context)
+
+        documents = [main_article]
+        topics = main_article.get("topics", [])
+        if expand_context and topics:
+            related = self.store.search(" ".join(topics[:3]), top_k=top_k + 1)
+            documents.extend(doc for doc in related if doc["article_id"] != article_id)
+            documents = documents[: top_k + 1]
+
+        context = RAGContext(
+            documents=documents,
+            query=query,
+            context_type="article",
+            metadata_filter=f"article_id={article_id}",
+        )
+        related_text = build_context_text(documents[1:]) if len(documents) > 1 else "No related articles available."
+        user_prompt = (
+            "The user is reading the following news article and has a question.\n\n"
+            f"**MAIN ARTICLE:**\n{build_context_text([main_article])}\n\n"
+            f"**RELATED ARTICLES (for context):**\n{related_text}\n\n"
+            f"**User's question:** {query}"
+        )
+        return self._response(query, await self._generate(ARTICLE_SYSTEM_PROMPT, user_prompt), context)
+
+    async def query_comparison(self, query: str, article_ids: list[str]) -> RAGResponse:
+        documents = self.store.get_many(article_ids)
+        found = {doc["article_id"] for doc in documents}
+        missing = [aid for aid in article_ids if aid not in found]
+
+        context = RAGContext(
+            documents=documents,
+            query=query,
+            context_type="comparison",
+            metadata_filter=f"article_ids={','.join(article_ids)}",
+        )
+        if not documents:
+            return self._response(query, "None of the specified articles were found.", context)
+
+        user_prompt = (
+            "Analyse and compare the following articles.\n\n"
+            f"{build_context_text(documents, max_chars=2500)}\n\n"
+            f"**Comparison request:** {query}"
+        )
+        if missing:
+            user_prompt += f"\n\nNote: these article IDs were not found: {', '.join(missing)}"
+        return self._response(query, await self._generate(COMPARISON_SYSTEM_PROMPT, user_prompt), context)
+
+    def get_stats(self) -> dict[str, Any]:
+        return {
+            "indexed_documents": len(self.store),
+            "model": self.model,
+            "llm_configured": self.llm_configured,
+            "retriever": "pathway" if self.pathway else "keyword",
+        }

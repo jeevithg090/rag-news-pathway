@@ -89,6 +89,8 @@ class Config:
     NEWS_RESULTS_PER_CATEGORY = _env_int("NEWS_RESULTS_PER_CATEGORY", 10)
     # Start the background Serper -> scraper -> index loop with the API server.
     NEWS_STREAMING_ENABLED = _env_bool("NEWS_STREAMING_ENABLED", False)
+    # Pre-load fictional sample articles at startup (for trying the UI without API keys).
+    DEMO_MODE = _env_bool("DEMO_MODE", False)
 
     # --- Retrieval / RAG -----------------------------------------------------
     RAG_TOP_K = _env_int("RAG_TOP_K", 5)

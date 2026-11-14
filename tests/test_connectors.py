@@ -75,3 +75,32 @@ def test_key_points_and_sentiment():
     assert detect_sentiment(analysis) == "negative"
     assert detect_sentiment("Overall an optimistic take") == "positive"
     assert detect_sentiment("Nothing notable") == "neutral"
+
+
+def test_scraper_handles_failed_downloads(monkeypatch):
+    import newsplease
+
+    from connectors.article_scraper import ArticleScraper
+
+    scraper = ArticleScraper(max_workers=1)
+    for failure in (None, {}):
+        monkeypatch.setattr(newsplease.NewsPlease, "from_url", staticmethod(lambda *a, _f=failure, **k: _f))
+        assert scraper._scrape_article_sync("https://n.com/x") is None
+
+    class FakeArticle:
+        title = "Tesla earnings beat"
+        maintext = "Tesla reported record EV deliveries."
+        date_publish = None
+        authors = ["A. Writer"]
+        source_domain = "n.com"
+        description = None
+        image_url = None
+        language = "en"
+
+    monkeypatch.setattr(newsplease.NewsPlease, "from_url", staticmethod(lambda *a, **k: FakeArticle()))
+    article = scraper._scrape_article_sync("https://n.com/y", category="Business")
+    assert article.title == "Tesla earnings beat"
+    assert article.source == "n.com"
+    assert article.author == "A. Writer"
+    assert article.topics == ["earnings", "Tesla", "EV"]
+    scraper.shutdown()

@@ -3,341 +3,349 @@
 
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Live AI News | Real-time Intelligent News</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Live AI News | Real-time news with AI chat</title>
     <meta name="description"
-        content="Live, personalised news feed with AI chat, article comparison and video analysis over continuously ingested articles.">
-    <meta name="theme-color" content="#0a0a0f">
+        content="A live, personalised news feed with AI chat, side-by-side article comparison and video analysis over continuously indexed articles.">
+    <meta name="theme-color" content="#f6f7fb" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#0b0b12" media="(prefers-color-scheme: dark)">
+    <meta name="color-scheme" content="light dark">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="Live AI News">
     <meta property="og:title" content="Live AI News">
-    <meta property="og:description" content="Real-time news with retrieval-augmented AI chat.">
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%236366f1'/%3E%3Cpath d='M8 10h16M8 16h12M8 22h8' stroke='white' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
+    <meta property="og:description" content="A live news feed with retrieval-augmented AI chat and article comparison.">
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:title" content="Live AI News">
+    <meta name="twitter:description" content="A live news feed with retrieval-augmented AI chat and article comparison.">
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <script>
+        // Apply the saved theme before first paint to avoid a flash of the wrong colours.
+        try {
+            const theme = localStorage.getItem('news_ai_theme');
+            if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme;
+        } catch (_) { /* storage unavailable */ }
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
-        rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/styles.css">
 </head>
 
 <body>
     <a class="skip-link" href="#main-content">Skip to content</a>
-    <div class="app">
-        <!-- Animated Background -->
-        <div class="bg-effects">
-            <div class="gradient-orb orb-1"></div>
-            <div class="gradient-orb orb-2"></div>
-            <div class="gradient-orb orb-3"></div>
-        </div>
 
-        <!-- Header -->
+    <svg width="0" height="0" class="sr-only" aria-hidden="true" focusable="false">
+        <defs>
+            <linearGradient id="logo-gradient" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#6366f1" />
+                <stop offset="1" stop-color="#8b5cf6" />
+            </linearGradient>
+        </defs>
+    </svg>
+
+    <div class="app">
         <header class="header">
             <div class="header-content">
-                <div class="logo">
-                    <div class="logo-icon">
-                        <svg aria-hidden="true" focusable="false" width="32" height="32" viewBox="0 0 32 32" fill="none">
-                            <rect width="32" height="32" rx="8" fill="url(#logo-gradient)" />
-                            <path d="M8 10h16M8 16h12M8 22h8" stroke="white" stroke-width="2" stroke-linecap="round" />
-                            <circle cx="24" cy="22" r="4" fill="white" opacity="0.9" />
-                            <defs>
-                                <linearGradient id="logo-gradient" x1="0" y1="0" x2="32" y2="32">
-                                    <stop stop-color="#6366f1" />
-                                    <stop offset="1" stop-color="#8b5cf6" />
-                                </linearGradient>
-                            </defs>
-                        </svg>
-                    </div>
-                    <div class="logo-text">
+                <a class="logo" href="#feed" aria-label="Live AI News, go to feed">
+                    <svg class="logo-icon" aria-hidden="true" focusable="false" width="32" height="32" viewBox="0 0 32 32" fill="none">
+                        <rect width="32" height="32" rx="8" fill="url(#logo-gradient)" />
+                        <path d="M8 10h16M8 16h12M8 22h8" stroke="white" stroke-width="2" stroke-linecap="round" />
+                        <circle cx="24" cy="22" r="4" fill="white" opacity="0.9" />
+                    </svg>
+                    <span class="logo-text">
                         <span class="logo-name">Live AI News</span>
                         <span class="logo-tagline">Powered by Pathway</span>
-                    </div>
-                    <div class="live-indicator">
-                        <span class="pulse"></span>
-                        <span>LIVE</span>
-                    </div>
-                </div>
+                    </span>
+                </a>
+                <span class="live-indicator" id="live-indicator" title="Live updates connection">
+                    <span class="pulse" aria-hidden="true"></span>
+                    <span class="live-label">Live</span>
+                </span>
 
                 <nav class="nav" aria-label="Sections">
-                    <button class="nav-btn active" data-section="feed">
-                        <svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                            stroke-width="2">
+                    <a class="nav-btn" href="#feed" data-section="feed" aria-current="page">
+                        <svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <rect x="3" y="3" width="7" height="7" rx="1" />
                             <rect x="14" y="3" width="7" height="7" rx="1" />
                             <rect x="3" y="14" width="7" height="7" rx="1" />
                             <rect x="14" y="14" width="7" height="7" rx="1" />
                         </svg>
                         <span>Feed</span>
-                    </button>
-                    <button class="nav-btn" data-section="chat">
-                        <svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                            stroke-width="2">
+                    </a>
+                    <a class="nav-btn" href="#chat" data-section="chat">
+                        <svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
                         </svg>
                         <span>AI Chat</span>
-                    </button>
-                    <button class="nav-btn" data-section="compare">
-                        <svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                            stroke-width="2">
+                    </a>
+                    <a class="nav-btn" href="#compare" data-section="compare">
+                        <svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <line x1="18" y1="20" x2="18" y2="10" />
                             <line x1="12" y1="20" x2="12" y2="4" />
                             <line x1="6" y1="20" x2="6" y2="14" />
                         </svg>
                         <span>Compare</span>
-                    </button>
+                    </a>
                 </nav>
 
                 <div class="header-actions">
-                    <a href="/onboarding/" class="btn-secondary personalize-link">Personalise</a>
-                    <button id="fetch-news-btn" class="btn-primary">
-                        <svg aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                            stroke-width="2">
+                    <button type="button" id="theme-toggle" class="btn btn-ghost btn-icon" aria-label="Switch to dark theme" title="Toggle theme">
+                        <svg class="icon-sun" aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                            <circle cx="12" cy="12" r="4" />
+                            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+                        </svg>
+                        <svg class="icon-moon" aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+                        </svg>
+                    </button>
+                    <a href="/onboarding/" class="btn btn-secondary personalize-link" aria-label="Personalise your feed">
+                        <svg aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 20h9" />
+                            <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
+                        </svg>
+                        <span class="btn-label">Personalise</span>
+                    </a>
+                    <button type="button" id="fetch-news-btn" class="btn btn-primary" aria-label="Fetch latest news">
+                        <svg class="btn-spinner-target" aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
                             <polyline points="23 4 23 10 17 10" />
                             <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
                         </svg>
-                        <span>Fetch News</span>
+                        <span class="btn-label" id="fetch-news-label">Fetch news</span>
                     </button>
                 </div>
             </div>
         </header>
 
-        <!-- Main Content -->
-        <main class="main" id="main-content">
-            <!-- News Feed Section -->
-            <section id="feed-section" class="section active">
+        <main class="main" id="main-content" tabindex="-1">
+            <!-- ================= Feed ================= -->
+            <section id="feed-section" class="section active" aria-labelledby="feed-title">
                 <div class="section-header">
                     <div class="section-title">
-                        <h1>Your Personalized Feed</h1>
-                        <p>Real-time news powered by adaptive RAG</p>
+                        <h1 id="feed-title">Your feed</h1>
+                        <p id="feed-subtitle">The latest indexed articles, ranked for you as you read.</p>
                     </div>
-                    <div class="section-actions">
+                    <div class="section-actions" role="search">
                         <div class="search-box">
-                            <svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                                stroke-width="2">
+                            <svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <circle cx="11" cy="11" r="8" />
                                 <line x1="21" y1="21" x2="16.65" y2="16.65" />
                             </svg>
-                            <input type="search" id="search-input" placeholder="Search articles..." aria-label="Search articles">
+                            <label for="search-input" class="sr-only">Search articles</label>
+                            <input type="search" id="search-input" class="input" placeholder="Search titles and topics" autocomplete="off">
                         </div>
-                        <select id="category-filter" class="filter-select" aria-label="Filter by category">
-                            <option value="">All Categories</option>
+                        <label for="category-filter" class="sr-only">Filter by category</label>
+                        <select id="category-filter" class="input select">
+                            <option value="">All categories</option>
                             <option value="Technology">Technology</option>
+                            <option value="Business">Business</option>
                             <option value="Finance">Finance</option>
                             <option value="Science">Science</option>
-                            <option value="Business">Business</option>
                             <option value="Health">Health</option>
+                            <option value="Politics">Politics</option>
+                            <option value="World">World</option>
+                            <option value="Entertainment">Entertainment</option>
+                            <option value="Sports">Sports</option>
                         </select>
                     </div>
                 </div>
 
-                <div id="news-feed" class="news-grid" aria-live="polite" aria-busy="true">
-                    <div class="empty-state">
-                        <div class="empty-icon">📰</div>
-                        <h3>No articles yet</h3>
-                        <p>Click "Fetch News" to load the latest articles</p>
-                    </div>
+                <p id="feed-summary" class="feed-summary" aria-live="polite"></p>
+
+                <div id="news-feed" class="news-grid" aria-busy="true">
+                    <!-- Skeleton cards shown until the first response arrives -->
+                    <div class="news-card skeleton" aria-hidden="true"><span></span><span></span><span></span></div>
+                    <div class="news-card skeleton" aria-hidden="true"><span></span><span></span><span></span></div>
+                    <div class="news-card skeleton" aria-hidden="true"><span></span><span></span><span></span></div>
                 </div>
             </section>
 
-            <!-- Chat Section -->
-            <section id="chat-section" class="section">
-                <div class="chat-layout">
-                    <div class="chat-main">
-                        <div class="chat-header-bar">
-                            <div class="chat-title">
-                                <svg aria-hidden="true" focusable="false" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                                    stroke-width="2">
-                                    <circle cx="12" cy="12" r="10" />
-                                    <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" />
-                                    <line x1="12" y1="17" x2="12.01" y2="17" />
+            <!-- ================= Chat ================= -->
+            <section id="chat-section" class="section" aria-labelledby="chat-title" hidden>
+                <div class="chat-main card">
+                    <div class="chat-header-bar">
+                        <div class="chat-title">
+                            <span class="chat-title-icon" aria-hidden="true">
+                                <svg focusable="false" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
                                 </svg>
-                                <div>
-                                    <h2>Ask AI About News</h2>
-                                    <span>Get insights from all indexed articles</span>
-                                </div>
-                            </div>
-                            <div class="chat-stats">
-                                <span id="indexed-count">0 articles indexed</span>
+                            </span>
+                            <div>
+                                <h1 id="chat-title">Ask about the news</h1>
+                                <p>Answers are grounded in the indexed articles, with sources.</p>
                             </div>
                         </div>
+                        <span class="chip" id="indexed-count">0 articles indexed</span>
+                    </div>
 
-                        <div id="chat-messages" class="chat-messages" aria-live="polite">
-                            <div class="message assistant">
-                                <div class="message-avatar">
-                                    <svg aria-hidden="true" focusable="false" width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
-                                        <path
-                                            d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8z" />
-                                        <circle cx="12" cy="12" r="3" />
-                                    </svg>
-                                </div>
-                                <div class="message-content">
-                                    <p>Hello! I'm your AI news analyst. I can answer questions about the latest news
-                                        articles. Try asking about technology, science, business, or any current topic!
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="chat-input-area">
-                            <div class="chat-input-wrapper">
-                                <input type="text" id="chat-input" placeholder="Ask anything about current news..." aria-label="Ask a question about the news" maxlength="2000">
-                                <button id="send-chat-btn" class="send-btn" aria-label="Send question">
-                                    <svg aria-hidden="true" focusable="false" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                                        stroke-width="2">
-                                        <line x1="22" y1="2" x2="11" y2="13" />
-                                        <polygon points="22 2 15 22 11 13 2 9 22 2" />
-                                    </svg>
-                                </button>
-                            </div>
-                            <div class="chat-hints">
-                                <button type="button" class="hint" onclick="setQuery('What is the latest in technology?')">Latest in
-                                    tech</button>
-                                <button type="button" class="hint" onclick="setQuery('Summarize today\\'s business news')">Business
-                                    summary</button>
-                                <button type="button" class="hint" onclick="setQuery('Any news about AI?')">AI news</button>
+                    <div id="chat-messages" class="chat-messages" role="log" aria-live="polite" aria-label="Conversation">
+                        <div class="message assistant">
+                            <div class="message-avatar" aria-hidden="true">AI</div>
+                            <div class="message-content">
+                                <p>Hi! Ask me anything about the articles in your feed, for example what changed in tech this week or how two stories relate.</p>
                             </div>
                         </div>
                     </div>
+
+                    <form class="chat-input-area" id="chat-form" novalidate>
+                        <div class="chat-hints" aria-label="Suggested questions">
+                            <button type="button" class="hint" data-query="What is the latest in technology?">Latest in tech</button>
+                            <button type="button" class="hint" data-query="Summarise today's business news">Business summary</button>
+                            <button type="button" class="hint" data-query="Any news about AI?">AI news</button>
+                        </div>
+                        <div class="chat-input-wrapper">
+                            <label for="chat-input" class="sr-only">Ask a question about the news</label>
+                            <input type="text" id="chat-input" class="input" placeholder="Ask anything about current news…" maxlength="2000" autocomplete="off" aria-describedby="chat-error">
+                            <button type="submit" id="send-chat-btn" class="btn btn-primary btn-icon send-btn" aria-label="Send question">
+                                <svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <line x1="22" y1="2" x2="11" y2="13" />
+                                    <polygon points="22 2 15 22 11 13 2 9 22 2" />
+                                </svg>
+                            </button>
+                        </div>
+                        <p id="chat-error" class="field-error" role="alert"></p>
+                    </form>
                 </div>
             </section>
 
-            <!-- Compare Section -->
-            <section id="compare-section" class="section">
-                <div class="compare-layout">
-                    <div class="compare-header">
-                        <h1>Compare Articles</h1>
-                        <p>Select two articles for AI-powered comparative analysis</p>
+            <!-- ================= Compare ================= -->
+            <section id="compare-section" class="section" aria-labelledby="compare-title" hidden>
+                <div class="section-header">
+                    <div class="section-title">
+                        <h1 id="compare-title">Compare articles</h1>
+                        <p>Pick two articles and ask how they differ. The answer cites both.</p>
                     </div>
+                </div>
 
+                <form id="compare-form" class="compare-form" novalidate>
                     <div class="compare-selector">
-                        <div class="compare-card">
-                            <div class="compare-card-header">
-                                <span class="compare-label">Article 1</span>
-                            </div>
-                            <select id="compare-select-1" class="compare-select" aria-label="First article">
-                                <option value="">Select an article...</option>
+                        <div class="compare-card card">
+                            <label class="field-label" for="compare-select-1">First article</label>
+                            <select id="compare-select-1" class="input select compare-select">
+                                <option value="">Select an article…</option>
                             </select>
-                            <div id="compare-preview-1" class="compare-preview"></div>
+                            <div id="compare-preview-1" class="compare-preview">No article selected</div>
                         </div>
 
-                        <div class="compare-divider">
-                            <div class="vs-badge">VS</div>
-                        </div>
+                        <div class="compare-divider" aria-hidden="true"><span class="vs-badge">VS</span></div>
 
-                        <div class="compare-card">
-                            <div class="compare-card-header">
-                                <span class="compare-label">Article 2</span>
-                            </div>
-                            <select id="compare-select-2" class="compare-select" aria-label="Second article">
-                                <option value="">Select an article...</option>
+                        <div class="compare-card card">
+                            <label class="field-label" for="compare-select-2">Second article</label>
+                            <select id="compare-select-2" class="input select compare-select">
+                                <option value="">Select an article…</option>
                             </select>
-                            <div id="compare-preview-2" class="compare-preview"></div>
+                            <div id="compare-preview-2" class="compare-preview">No article selected</div>
                         </div>
                     </div>
 
                     <div class="compare-action">
-                        <input type="text" id="compare-query" class="compare-input" aria-label="Comparison question" maxlength="2000"
-                            placeholder="What would you like to compare? (e.g., Compare their impact on the market)">
-                        <button id="compare-btn" class="btn-primary btn-large">
-                            <svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                                stroke-width="2">
-                                <circle cx="12" cy="12" r="10" />
-                                <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" />
-                            </svg>
-                            <span>Analyze & Compare</span>
-                        </button>
+                        <label class="field-label" for="compare-query">What should the comparison focus on? <span class="optional">(optional)</span></label>
+                        <div class="compare-action-row">
+                            <input type="text" id="compare-query" class="input" maxlength="2000" autocomplete="off"
+                                placeholder="e.g. How do they differ on the market impact?" aria-describedby="compare-error">
+                            <button type="submit" id="compare-btn" class="btn btn-primary btn-large">
+                                <span class="btn-label">Compare</span>
+                            </button>
+                        </div>
+                        <p id="compare-error" class="field-error" role="alert"></p>
                     </div>
+                </form>
 
-                    <div id="compare-result" class="compare-result" aria-live="polite"></div>
-                </div>
+                <div id="compare-result" class="compare-result" aria-live="polite"></div>
             </section>
         </main>
 
-        <!-- Article Modal -->
-        <div id="article-modal" class="modal" role="dialog" aria-modal="true" aria-label="Article details" aria-hidden="true">
-            <div class="modal-backdrop" onclick="closeModal()"></div>
-            <div class="modal-container">
-                <button class="modal-close" onclick="closeModal()" aria-label="Close article">
-                    <svg aria-hidden="true" focusable="false" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <line x1="18" y1="6" x2="6" y2="18" />
-                        <line x1="6" y1="6" x2="18" y2="18" />
-                    </svg>
-                </button>
-                <div id="modal-article-content" class="modal-article"></div>
-                <div class="modal-chat">
-                    <h3>💬 Chat about this article</h3>
-                    <div id="article-chat-messages" class="article-chat-messages" aria-live="polite"></div>
-                    <div class="article-chat-input">
-                        <input type="text" id="article-chat-input" placeholder="Ask about this article..." aria-label="Ask about this article" maxlength="2000">
-                        <button id="send-article-chat-btn" class="send-btn" aria-label="Send article question">
-                            <svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                                stroke-width="2">
-                                <line x1="22" y1="2" x2="11" y2="13" />
-                                <polygon points="22 2 15 22 11 13 2 9 22 2" />
-                            </svg>
-                        </button>
-                    </div>
-                </div>
-
-                <!-- YouTube Video Analysis Section -->
-                <div class="youtube-section">
-                    <div class="youtube-header">
-                        <h3>🎬 YouTube Video Analysis</h3>
-                        <button id="fetch-youtube-btn" class="btn-secondary" onclick="fetchYouTubeVideos()">
-                            <svg aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                                stroke-width="2">
-                                <polygon points="23 7 16 12 23 17 23 7" />
-                                <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
-                            </svg>
-                            <span>Find Related Videos</span>
-                        </button>
-                    </div>
-
-                    <div id="youtube-videos-list" class="youtube-videos-list" style="display: none;">
-                        <!-- Video options will be populated here -->
-                    </div>
-
-                    <div id="youtube-analysis-loading" class="youtube-loading" style="display: none;">
-                        <div class="loading-spinner"></div>
-                        <p>Downloading audio, transcribing with Whisper, and analyzing...</p>
-                        <span class="loading-hint">This may take 1-3 minutes depending on video length</span>
-                    </div>
-
-                    <div id="youtube-analysis-result" class="youtube-analysis-result" style="display: none;">
-                        <div class="analysis-header">
-                            <h4>📊 Video Analysis</h4>
-                            <span id="video-sentiment" class="sentiment-badge"></span>
-                        </div>
-                        <div id="video-key-points" class="key-points"></div>
-                        <div id="video-analysis-text" class="analysis-text"></div>
-                        <details class="transcript-details">
-                            <summary>📝 View Full Transcript</summary>
-                            <div id="video-transcript" class="transcript-content"></div>
-                        </details>
-                    </div>
-                </div>
-
-                <div id="comparison-suggestion" class="comparison-suggestion"></div>
-            </div>
-        </div>
-
-        <!-- Status Bar -->
         <footer class="status-bar">
-            <div class="status-left">
-                <div class="status-indicator">
-                    <span class="status-dot" id="status-dot"></span>
-                    <span id="connection-status">Connecting...</span>
-                </div>
+            <div class="status-indicator">
+                <span class="status-dot" id="status-dot" aria-hidden="true"></span>
+                <span id="connection-status">Connecting…</span>
             </div>
             <div class="status-center">
                 <span id="article-count">0 articles</span>
-                <span class="divider">•</span>
+                <span class="divider" aria-hidden="true">•</span>
                 <span id="last-update">Ready</span>
             </div>
             <div class="status-right">
-                <span>DataQuest 2026 • Pathway Framework</span>
+                <a href="/docs">API docs</a>
+                <span class="divider" aria-hidden="true">•</span>
+                <span>Built with Pathway</span>
             </div>
         </footer>
     </div>
 
-    <script src="/static/app.js"></script>
+    <!-- ================= Article dialog ================= -->
+    <div id="article-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" hidden>
+        <div class="modal-backdrop" data-close-modal></div>
+        <div class="modal-container" tabindex="-1">
+            <button type="button" class="modal-close btn btn-ghost btn-icon" data-close-modal aria-label="Close article">
+                <svg aria-hidden="true" focusable="false" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                    <line x1="18" y1="6" x2="6" y2="18" />
+                    <line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+            </button>
+
+            <div id="modal-article-content" class="modal-article">
+                <h2 id="modal-title" class="sr-only">Article</h2>
+            </div>
+
+            <div id="comparison-suggestion" class="comparison-suggestion" hidden></div>
+
+            <section class="modal-panel" aria-labelledby="article-chat-title">
+                <h3 id="article-chat-title">Ask about this article</h3>
+                <div id="article-chat-messages" class="article-chat-messages" role="log" aria-live="polite"></div>
+                <form class="article-chat-input" id="article-chat-form" novalidate>
+                    <label for="article-chat-input" class="sr-only">Ask about this article</label>
+                    <input type="text" id="article-chat-input" class="input" placeholder="e.g. What are the key facts?" maxlength="2000" autocomplete="off">
+                    <button type="submit" id="send-article-chat-btn" class="btn btn-primary btn-icon send-btn" aria-label="Send article question">
+                        <svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <line x1="22" y1="2" x2="11" y2="13" />
+                            <polygon points="22 2 15 22 11 13 2 9 22 2" />
+                        </svg>
+                    </button>
+                </form>
+            </section>
+
+            <section class="modal-panel youtube-section" aria-labelledby="youtube-title">
+                <div class="youtube-header">
+                    <div>
+                        <h3 id="youtube-title">Related videos</h3>
+                        <p class="muted">Find YouTube coverage and compare it with the article. Needs the optional video dependencies.</p>
+                    </div>
+                    <button type="button" id="fetch-youtube-btn" class="btn btn-secondary">
+                        <svg aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polygon points="23 7 16 12 23 17 23 7" />
+                            <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+                        </svg>
+                        <span class="btn-label">Find videos</span>
+                    </button>
+                </div>
+
+                <div id="youtube-videos-list" class="youtube-videos-list" hidden></div>
+
+                <div id="youtube-analysis-loading" class="youtube-loading" role="status" hidden>
+                    <div class="loading-spinner" aria-hidden="true"></div>
+                    <p>Downloading audio, transcribing and analysing…</p>
+                    <span class="muted">This can take 1 to 3 minutes depending on the video length.</span>
+                </div>
+
+                <div id="youtube-analysis-result" class="youtube-analysis-result" hidden>
+                    <div class="analysis-header">
+                        <h4>Video analysis</h4>
+                        <span id="video-sentiment" class="badge"></span>
+                    </div>
+                    <div id="video-key-points" class="key-points"></div>
+                    <div id="video-analysis-text" class="analysis-text"></div>
+                    <details class="transcript-details">
+                        <summary>View full transcript</summary>
+                        <div id="video-transcript" class="transcript-content"></div>
+                    </details>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="false"></div>
+
+    <script src="/static/app.js" defer></script>
 </body>
 
 </html>

@@ -1,15 +1,20 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import './App.css'
 
 // In dev the questionnaire runs on Vite (:3000) while the main app is served by FastAPI.
 // Anonymous user ID shared with the main app through localStorage.
 function getOrCreateUserId() {
-  let id = localStorage.getItem('news_ai_user_id')
-  if (!id) {
-    id = 'user_' + Date.now() + '_' + Math.random().toString(36).slice(2, 11)
-    localStorage.setItem('news_ai_user_id', id)
+  const fresh = () => 'user_' + Date.now() + '_' + Math.random().toString(36).slice(2, 11)
+  try {
+    let id = localStorage.getItem('news_ai_user_id')
+    if (!id) {
+      id = fresh()
+      localStorage.setItem('news_ai_user_id', id)
+    }
+    return id
+  } catch {
+    return fresh() // storage unavailable (private mode): answers are saved for this visit only
   }
-  return id
 }
 
 const MAIN_APP_URL = import.meta.env.VITE_MAIN_APP_URL ?? (import.meta.env.DEV ? 'http://localhost:8000/' : '/')
@@ -158,6 +163,44 @@ const questions = [
   }
 ]
 
+function Logo() {
+  return (
+    <svg aria-hidden="true" width="28" height="28" viewBox="0 0 32 32" fill="none">
+      <defs>
+        <linearGradient id="logo-gradient" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
+          <stop stopColor="#6366f1" />
+          <stop offset="1" stopColor="#8b5cf6" />
+        </linearGradient>
+      </defs>
+      <rect width="32" height="32" rx="8" fill="url(#logo-gradient)" />
+      <path d="M8 10h16M8 16h12M8 22h8" stroke="white" strokeWidth="2" strokeLinecap="round" />
+      <circle cx="24" cy="22" r="4" fill="white" opacity="0.9" />
+    </svg>
+  )
+}
+
+function Check() {
+  return (
+    <span className="option-check" aria-hidden="true">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M20 6 9 17l-5-5" />
+      </svg>
+    </span>
+  )
+}
+
+function TopBar() {
+  return (
+    <header className="topbar">
+      <a className="brand" href={MAIN_APP_URL}>
+        <Logo />
+        <span>Live AI News</span>
+      </a>
+      <a className="skip-link" href={MAIN_APP_URL}>Skip for now</a>
+    </header>
+  )
+}
+
 function App() {
   const [currentQuestion, setCurrentQuestion] = useState(0)
   const [responses, setResponses] = useState({
@@ -177,8 +220,9 @@ function App() {
   const [isComplete, setIsComplete] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [direction, setDirection] = useState('next')
-
   const [error, setError] = useState(null)
+  const headingRef = useRef(null)
+  const hasInteracted = useRef(false)
 
   useEffect(() => {
     // Skip the questionnaire if this user already completed it
@@ -189,6 +233,11 @@ function App() {
       })
       .catch(() => { /* backend unreachable: let the user fill the form anyway */ })
   }, [userId])
+
+  useEffect(() => {
+    // Move focus to the new question so keyboard and screen reader users hear it.
+    if (hasInteracted.current) headingRef.current?.focus()
+  }, [currentQuestion, isComplete])
 
   const handleMultiSelect = (field, value) => {
     setResponses(prev => {
@@ -203,26 +252,32 @@ function App() {
   const handleSingleSelect = (field, value, autoAdvance = true) => {
     setResponses(prev => ({ ...prev, [field]: value }))
     if (autoAdvance && currentQuestion < questions.length - 1) {
-      setTimeout(() => goNext(), 300)
+      // Advance only if the user hasn't already moved on (guards against double clicks).
+      const from = currentQuestion
+      setTimeout(() => {
+        hasInteracted.current = true
+        setDirection('next')
+        setCurrentQuestion(prev => (prev === from ? prev + 1 : prev))
+      }, 300)
     }
   }
 
   const handleSlider = (key, value) => {
-    setResponses(prev => ({ ...prev, [key]: parseInt(value) }))
+    setResponses(prev => ({ ...prev, [key]: parseInt(value, 10) }))
   }
 
   const goNext = () => {
-    if (currentQuestion < questions.length - 1) {
-      setDirection('next')
-      setCurrentQuestion(prev => prev + 1)
-    }
+    hasInteracted.current = true
+    setError(null)
+    setDirection('next')
+    setCurrentQuestion(prev => Math.min(prev + 1, questions.length - 1))
   }
 
   const goBack = () => {
-    if (currentQuestion > 0) {
-      setDirection('back')
-      setCurrentQuestion(prev => prev - 1)
-    }
+    hasInteracted.current = true
+    setError(null)
+    setDirection('back')
+    setCurrentQuestion(prev => Math.max(prev - 1, 0))
   }
 
   const isCurrentValid = () => {
@@ -234,146 +289,154 @@ function App() {
   }
 
   const submit = async () => {
-    if (!isCurrentValid()) return
+    if (!isCurrentValid() || isLoading) return
     setIsLoading(true)
     setError(null)
 
     try {
-      const payload = {
-        user_id: userId,
-        ...responses
-      }
-
       const res = await fetch('/api/onboarding', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify({ user_id: userId, ...responses })
       })
-
       const data = await res.json().catch(() => ({}))
       if (res.ok && data.success) {
+        hasInteracted.current = true
         setIsComplete(true)
       } else {
         setError(typeof data.detail === 'string' ? data.detail : 'Could not save your answers. Please try again.')
       }
     } catch {
-      setError('Could not reach the server. Please check your connection and try again.')
+      setError('Could not reach the server. Check your connection and try again.')
     }
     setIsLoading(false)
   }
 
-  const progress = ((currentQuestion + 1) / questions.length) * 100
-
   if (isComplete) {
     return (
       <div className="app">
-        <div className="bg-effects">
-          <div className="gradient-orb orb-1"></div>
-          <div className="gradient-orb orb-2"></div>
-          <div className="gradient-orb orb-3"></div>
-        </div>
-        <div className="success-screen">
-          <div className="success-icon">🎉</div>
-          <h1>You're all set!</h1>
-          <p>We've personalized your news experience based on your preferences.</p>
-          <button className="btn-primary" onClick={() => window.location.href = MAIN_APP_URL}>
-            Start Exploring
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+        <TopBar />
+        <main className="success-screen" role="status">
+          <div className="success-icon" aria-hidden="true">🎉</div>
+          <h1 ref={headingRef} tabIndex={-1}>You're all set!</h1>
+          <p>Your feed will now favour the topics you picked. It keeps adapting as you read and chat.</p>
+          <a className="btn btn-primary" href={MAIN_APP_URL}>
+            Go to my feed
+            <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M5 12h14M12 5l7 7-7 7" />
             </svg>
-          </button>
-        </div>
+          </a>
+        </main>
       </div>
     )
   }
 
   const q = questions[currentQuestion]
+  const progress = ((currentQuestion + 1) / questions.length) * 100
+  const isLast = currentQuestion === questions.length - 1
+  const valid = isCurrentValid()
+  const selectedCount = Array.isArray(responses[q.field]) ? responses[q.field].length : 0
 
   return (
     <div className="app">
-      <div className="bg-effects">
-        <div className="gradient-orb orb-1"></div>
-        <div className="gradient-orb orb-2"></div>
-        <div className="gradient-orb orb-3"></div>
-      </div>
+      <TopBar />
 
-      <div className="onboarding-container">
-        {/* Progress */}
+      <main className="onboarding-container">
         <div className="progress-container">
-          <div className="progress-bar">
+          <p className="progress-text">
+            <span>Question {currentQuestion + 1} of {questions.length}</span>
+            <span>{Math.round(progress)}%</span>
+          </p>
+          <div
+            className="progress-bar"
+            role="progressbar"
+            aria-label="Questionnaire progress"
+            aria-valuemin={1}
+            aria-valuemax={questions.length}
+            aria-valuenow={currentQuestion + 1}
+          >
             <div className="progress-fill" style={{ width: `${progress}%` }}></div>
           </div>
-          <p className="progress-text">Question {currentQuestion + 1} of {questions.length}</p>
         </div>
 
-        {/* Question */}
-        <div className={`question-card ${direction}`} key={currentQuestion}>
+        <section className={`question-card ${direction}`} key={currentQuestion} aria-labelledby="question-title">
           <div className="question-header">
-            <span className="question-emoji">{q.emoji}</span>
-            <h2>{q.title}</h2>
-            <p>{q.subtitle}</p>
+            <span className="question-emoji" aria-hidden="true">{q.emoji}</span>
+            <h1 id="question-title" ref={headingRef} tabIndex={-1}>{q.title}</h1>
+            <p id="question-subtitle">{q.subtitle}</p>
           </div>
 
-          {/* Multi-select pills */}
           {(q.type === 'multi' || q.type === 'single-grid') && (
-            <div className="options-grid">
-              {q.options.map(opt => (
-                <button
-                  key={opt.value}
-                  className={`option-pill ${q.type === 'multi'
-                    ? (responses[q.field]?.includes(opt.value) ? 'selected' : '')
-                    : (responses[q.field] === opt.value ? 'selected' : '')
-                    }`}
-                  onClick={() => q.type === 'multi'
-                    ? handleMultiSelect(q.field, opt.value)
-                    : handleSingleSelect(q.field, opt.value, false)
-                  }
-                >
-                  <span className="option-icon">{opt.icon}</span>
-                  <span>{opt.label}</span>
-                </button>
-              ))}
+            <div className="options-grid" role="group" aria-labelledby="question-title" aria-describedby="question-subtitle">
+              {q.options.map(opt => {
+                const selected = q.type === 'multi'
+                  ? responses[q.field]?.includes(opt.value)
+                  : responses[q.field] === opt.value
+                return (
+                  <button
+                    type="button"
+                    key={opt.value}
+                    className="option-pill"
+                    aria-pressed={Boolean(selected)}
+                    onClick={() => q.type === 'multi'
+                      ? handleMultiSelect(q.field, opt.value)
+                      : handleSingleSelect(q.field, opt.value, false)
+                    }
+                  >
+                    <span className="option-icon" aria-hidden="true">{opt.icon}</span>
+                    <span>{opt.label}</span>
+                    <Check />
+                  </button>
+                )
+              })}
             </div>
           )}
 
-          {/* Single-select cards */}
           {q.type === 'single' && (
-            <div className="options-stack">
+            <div className="options-stack" role="group" aria-labelledby="question-title" aria-describedby="question-subtitle">
               {q.options.map(opt => (
                 <button
+                  type="button"
                   key={opt.value}
-                  className={`option-card ${responses[q.field] === opt.value ? 'selected' : ''}`}
+                  className="option-card"
+                  aria-pressed={responses[q.field] === opt.value}
                   onClick={() => handleSingleSelect(q.field, opt.value)}
                 >
-                  <div className="option-card-icon">{opt.icon}</div>
-                  <div className="option-card-content">
-                    <h4>{opt.label}</h4>
-                    <p>{opt.desc}</p>
-                  </div>
+                  <span className="option-card-icon" aria-hidden="true">{opt.icon}</span>
+                  <span className="option-card-content">
+                    <span className="option-card-title">{opt.label}</span>
+                    <span className="option-card-desc">{opt.desc}</span>
+                  </span>
+                  <Check />
                 </button>
               ))}
             </div>
           )}
 
-          {/* Sliders */}
           {q.type === 'sliders' && (
             <div className="slider-group">
               {q.sliders.map(slider => (
                 <div key={slider.key} className="slider-item">
                   <div className="slider-header">
-                    <span className="slider-label">{slider.icon} {slider.label}</span>
-                    <span className="slider-value">{responses[slider.key]}</span>
+                    <label className="slider-label" htmlFor={slider.key}>
+                      <span aria-hidden="true">{slider.icon} </span>{slider.label}
+                    </label>
+                    <span className="slider-value" aria-hidden="true">{responses[slider.key]}</span>
                   </div>
-                  <p className="slider-desc">{slider.desc}</p>
+                  <p className="slider-desc" id={`${slider.key}-desc`}>{slider.desc}</p>
                   <input
+                    id={slider.key}
                     type="range"
                     min="1"
                     max="5"
+                    step="1"
                     value={responses[slider.key]}
                     onChange={(e) => handleSlider(slider.key, e.target.value)}
+                    aria-describedby={`${slider.key}-desc`}
+                    aria-valuetext={`${responses[slider.key]} out of 5`}
                     className="slider"
                   />
-                  <div className="slider-labels">
+                  <div className="slider-labels" aria-hidden="true">
                     <span>Not important</span>
                     <span>Very important</span>
                   </div>
@@ -381,50 +444,38 @@ function App() {
               ))}
             </div>
           )}
-        </div>
+        </section>
 
-        {error && (
-          <p className="form-error" role="alert">{error}</p>
+        {q.type === 'multi' && (
+          <p className="hint-text" aria-live="polite">
+            {selectedCount ? `${selectedCount} selected` : 'Pick at least one to continue'}
+          </p>
         )}
 
-        {/* Navigation */}
+        {error && <p className="form-error" role="alert">{error}</p>}
+
         <div className="nav-buttons">
-          <button
-            className="nav-btn-back"
-            onClick={goBack}
-            disabled={currentQuestion === 0}
-          >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <button type="button" className="btn btn-secondary" onClick={goBack} disabled={currentQuestion === 0}>
+            <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M15 18l-6-6 6-6" />
             </svg>
             Back
           </button>
 
-          {currentQuestion < questions.length - 1 ? (
-            <button
-              className="nav-btn-next"
-              onClick={goNext}
-              disabled={!isCurrentValid()}
-            >
+          {!isLast ? (
+            <button type="button" className="btn btn-primary" onClick={goNext} disabled={!valid}>
               Next
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <path d="M9 18l6-6-6-6" />
               </svg>
             </button>
           ) : (
-            <button
-              className="nav-btn-submit"
-              onClick={submit}
-              disabled={isLoading}
-            >
-              {isLoading ? 'Saving...' : "Let's Go!"}
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M5 12h14M12 5l7 7-7 7" />
-              </svg>
+            <button type="button" className="btn btn-primary" onClick={submit} disabled={isLoading} aria-busy={isLoading}>
+              {isLoading ? <><span className="spinner" aria-hidden="true"></span>Saving…</> : <>Finish</>}
             </button>
           )}
         </div>
-      </div>
+      </main>
     </div>
   )
 }

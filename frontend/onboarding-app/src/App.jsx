@@ -1,6 +1,19 @@
 import { useState, useEffect } from 'react'
 import './App.css'
 
+// In dev the questionnaire runs on Vite (:3000) while the main app is served by FastAPI.
+// Anonymous user ID shared with the main app through localStorage.
+function getOrCreateUserId() {
+  let id = localStorage.getItem('news_ai_user_id')
+  if (!id) {
+    id = 'user_' + Date.now() + '_' + Math.random().toString(36).slice(2, 11)
+    localStorage.setItem('news_ai_user_id', id)
+  }
+  return id
+}
+
+const MAIN_APP_URL = import.meta.env.VITE_MAIN_APP_URL ?? (import.meta.env.DEV ? 'http://localhost:8000/' : '/')
+
 // Question data
 const questions = [
   {
@@ -160,35 +173,22 @@ function App() {
     importance_accurate: 3,
     importance_engaging: 3
   })
-  const [userId, setUserId] = useState(null)
+  const [userId] = useState(getOrCreateUserId)
   const [isComplete, setIsComplete] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [direction, setDirection] = useState('next')
 
+  const [error, setError] = useState(null)
+
   useEffect(() => {
-    // Generate or get user ID
-    let id = localStorage.getItem('news_ai_user_id')
-    if (!id) {
-      id = 'user_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9)
-      localStorage.setItem('news_ai_user_id', id)
-    }
-    setUserId(id)
-
-    // Check existing onboarding
-    checkExistingOnboarding(id)
-  }, [])
-
-  const checkExistingOnboarding = async (id) => {
-    try {
-      const res = await fetch(`/api/onboarding/check/${id}`)
-      const data = await res.json()
-      if (data.completed) {
-        window.location.href = 'http://localhost:8000/'
-      }
-    } catch (e) {
-      console.log('No existing onboarding')
-    }
-  }
+    // Skip the questionnaire if this user already completed it
+    fetch(`/api/onboarding/check/${encodeURIComponent(userId)}`)
+      .then(res => (res.ok ? res.json() : null))
+      .then(data => {
+        if (data?.completed) window.location.href = MAIN_APP_URL
+      })
+      .catch(() => { /* backend unreachable: let the user fill the form anyway */ })
+  }, [userId])
 
   const handleMultiSelect = (field, value) => {
     setResponses(prev => {
@@ -236,6 +236,7 @@ function App() {
   const submit = async () => {
     if (!isCurrentValid()) return
     setIsLoading(true)
+    setError(null)
 
     try {
       const payload = {
@@ -249,13 +250,14 @@ function App() {
         body: JSON.stringify(payload)
       })
 
-      const data = await res.json()
-      if (data.success) {
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && data.success) {
         setIsComplete(true)
+      } else {
+        setError(typeof data.detail === 'string' ? data.detail : 'Could not save your answers. Please try again.')
       }
-    } catch (e) {
-      console.error('Error:', e)
-      alert('Something went wrong. Please try again.')
+    } catch {
+      setError('Could not reach the server. Please check your connection and try again.')
     }
     setIsLoading(false)
   }
@@ -274,7 +276,7 @@ function App() {
           <div className="success-icon">🎉</div>
           <h1>You're all set!</h1>
           <p>We've personalized your news experience based on your preferences.</p>
-          <button className="btn-primary" onClick={() => window.location.href = 'http://localhost:8000/'}>
+          <button className="btn-primary" onClick={() => window.location.href = MAIN_APP_URL}>
             Start Exploring
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M5 12h14M12 5l7 7-7 7" />
@@ -380,6 +382,10 @@ function App() {
             </div>
           )}
         </div>
+
+        {error && (
+          <p className="form-error" role="alert">{error}</p>
+        )}
 
         {/* Navigation */}
         <div className="nav-buttons">

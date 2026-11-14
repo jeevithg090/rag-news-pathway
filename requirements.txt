@@ -1,35 +1,18 @@
-# Pathway Framework
-pathway>=0.28.0
+# Core runtime: API server, ingestion, RAG and the Pathway indexing service.
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30
+pydantic>=2.7,<3
+sqlalchemy>=2.0.30,<3
+httpx>=0.27,<1
+openai>=1.40
+python-dotenv>=1.0
 
-# News Scraping
-news-please>=1.5.35
-requests>=2.31.0
-beautifulsoup4>=4.12.0
-lxml>=4.9.0
+# News discovery and scraping
+news-please>=1.6
+requests>=2.32.3
+beautifulsoup4>=4.12
+lxml>=5.0
 
-# API Framework
-fastapi>=0.109.0
-uvicorn[standard]>=0.27.0
-websockets>=12.0
-pydantic>=2.5.0
-pydantic-settings>=2.1.0
-
-# Database
-sqlalchemy>=2.0.0
-alembic>=1.13.0
-psycopg2-binary>=2.9.9
-asyncpg>=0.29.0
-
-# LLM Integration
-openai>=1.10.0
-
-# Utilities
-python-dotenv>=1.0.0
-typing-extensions>=4.5.0
-aiofiles>=23.2.0
-httpx>=0.26.0
-
-# YouTube Analysis
-yt-dlp>=2024.1.0
-openai-whisper>=20231117
-pytubefix>=2.0.0
+# Pathway live indexing (pipeline/document_pipeline.py)
+pathway>=0.20
+tiktoken>=0.7

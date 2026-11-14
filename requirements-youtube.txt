@@ -1,0 +1,4 @@
+# Optional: YouTube video analysis (/api/youtube/analyze). Also requires the ffmpeg binary.
+openai-whisper>=20240930
+pytubefix>=8.0
+yt-dlp>=2024.10.22
